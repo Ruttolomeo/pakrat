@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.part
+# dati locali dell'utente: config con API key, backup, cache download
+config.json
+backups/
+cache/
+old-paks/

@@ -1,0 +1,1024 @@
+#!/usr/bin/env python3
+"""
+pakrat-gui - interfaccia grafica Qt per pakrat.
+
+Riusa il core di pakrat (parser LSPK, load order, backup, Nexus): qui c'e' solo
+la presentazione, nessuna logica duplicata.
+
+Copyright (C) 2026 Ruttolomeo
+SPDX-License-Identifier: GPL-3.0-or-later
+
+Questo programma e' software libero: puoi ridistribuirlo e/o modificarlo secondo
+i termini della GNU General Public License come pubblicata dalla Free Software
+Foundation, versione 3 o (a tua scelta) una successiva. E' distribuito nella
+speranza che sia utile, ma SENZA ALCUNA GARANZIA. Vedi il file LICENSE.
+"""
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+from PySide6.QtCore import Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QKeySequence
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog,
+                               QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+                               QLineEdit, QMainWindow, QMessageBox, QPushButton,
+                               QStatusBar, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidget)
+
+# realpath e non abspath: cosi' funziona anche lanciato da un symlink in ~/.local/bin
+CORE_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pakrat")
+
+
+def load_core():
+    loader = importlib.machinery.SourceFileLoader("pakrat_core", CORE_PATH)
+    spec = importlib.util.spec_from_loader("pakrat_core", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+core = load_core()
+
+COL_ON, COL_NUM, COL_NAME, COL_VER, COL_AUTHOR, COL_NEXUS = range(6)
+HEADERS = ["", "#", "Mod", "Versione", "Autore", "Nexus"]
+
+
+class CheckWorker(QThread):
+    """Il controllo aggiornamenti fa rete: fuori dal thread della UI."""
+    row_done = Signal(str, str)
+    finished_all = Signal(str)
+
+    def __init__(self, mods):
+        super().__init__()
+        self.mods = mods
+
+    def run(self):
+        try:
+            cfg = core.load_config()
+        except SystemExit as ex:
+            self.finished_all.emit(str(ex))
+            return
+        if not cfg["nexus_api_key"]:
+            self.finished_all.emit("API key Nexus non configurata (menu Nexus -> Imposta API key)")
+            return
+        mapped = [m for m in self.mods
+                  if m.uuid in cfg["mods"] and cfg["mods"][m.uuid].get("nexus_id")]
+        if not mapped:
+            self.finished_all.emit("nessuna mod associata a un ID Nexus: usa Nexus -> Associa a Nexus")
+            return
+        errors = 0
+        for m in mapped:
+            entry = cfg["mods"][m.uuid]
+            try:
+                info = core.nexus_get(f"/mods/{entry['nexus_id']}.json", cfg["nexus_api_key"])
+            except core.NexusError as ex:
+                self.row_done.emit(m.uuid, f"errore: {ex}")
+                errors += 1
+                continue
+            remote = (info.get("version") or "").strip()
+            local = entry.get("installed_version") or m.version
+            if info.get("status") not in (None, "published"):
+                self.row_done.emit(m.uuid, f"mod {info.get('status')}")
+            elif remote and remote != local:
+                self.row_done.emit(m.uuid, f"aggiornamento -> {remote}")
+            else:
+                self.row_done.emit(m.uuid, "aggiornata")
+            entry["remote_version"] = remote
+        core.save_config(cfg)
+        self.finished_all.emit(f"controllo completato su {len(mapped)} mod"
+                               + (f", {errors} errori" if errors else ""))
+
+
+class SearchWorker(QThread):
+    """Ricerca candidati su Nexus (rete): fuori dal thread della UI."""
+    done = Signal(list, list)
+
+    def __init__(self, mod, api_key, term=None):
+        super().__init__()
+        self.mod, self.api_key, self.term = mod, api_key, term
+
+    def run(self):
+        try:
+            cands, errs = core.find_candidates(self.mod, self.api_key, extra_term=self.term)
+        except core.NexusError as ex:
+            self.done.emit([], [str(ex)])
+            return
+        self.done.emit(cands, errs)
+
+
+class MatchDialog(QDialog):
+    """Scelta manuale del corrispondente su Nexus fra i candidati trovati."""
+
+    def __init__(self, parent, mod, api_key):
+        super().__init__(parent)
+        self.mod, self.api_key = mod, api_key
+        self.chosen = None
+        self.cands = []
+        self.worker = None
+        self.setWindowTitle(f"Associa a Nexus - {mod.name}")
+        self.resize(820, 460)
+
+        lay = QVBoxLayout(self)
+        head = QLabel(f"<b>{mod.name}</b><br>autore nel .pak: "
+                      f"<i>{mod.author or 'sconosciuto'}</i> &nbsp; versione locale: {mod.version}")
+        head.setTextFormat(Qt.RichText)
+        lay.addWidget(head)
+
+        srow = QHBoxLayout()
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("cerca con altre parole e premi Invio...")
+        self.search_box.returnPressed.connect(self.do_search)
+        btn_s = QPushButton("Cerca")
+        btn_s.clicked.connect(self.do_search)
+        srow.addWidget(self.search_box)
+        srow.addWidget(btn_s)
+        lay.addLayout(srow)
+
+        self.list = QTableWidget(0, 5)
+        self.list.setHorizontalHeaderLabels(["Conf.", "Nome su Nexus", "Autore", "Versione", ""])
+        self.list.verticalHeader().setVisible(False)
+        self.list.setSelectionBehavior(QTableWidget.SelectRows)
+        self.list.setSelectionMode(QTableWidget.SingleSelection)
+        self.list.setEditTriggers(QTableWidget.NoEditTriggers)
+        hh = self.list.horizontalHeader()
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        for c in (0, 2, 3, 4):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.list.doubleClicked.connect(self.accept_choice)
+        lay.addWidget(self.list)
+
+        self.info = QLabel("ricerca in corso...")
+        lay.addWidget(self.info)
+
+        row = QHBoxLayout()
+        self.btn_open = QPushButton("Apri pagina su Nexus")
+        self.btn_open.clicked.connect(self.open_selected)
+        self.btn_ok = QPushButton("Associa la selezionata")
+        self.btn_ok.clicked.connect(self.accept_choice)
+        btn_skip = QPushButton("Nessuno di questi")
+        btn_skip.clicked.connect(self.reject)
+        row.addWidget(self.btn_open)
+        row.addStretch()
+        row.addWidget(btn_skip)
+        row.addWidget(self.btn_ok)
+        lay.addLayout(row)
+
+        self.start_search(None)
+
+    def start_search(self, term):
+        self.info.setText("ricerca in corso...")
+        self.btn_ok.setEnabled(False)
+        self.worker = SearchWorker(self.mod, self.api_key, term)
+        self.worker.done.connect(self.on_results)
+        self.worker.start()
+
+    def do_search(self):
+        t = self.search_box.text().strip()
+        self.start_search(t or None)
+
+    def on_results(self, cands, errs):
+        self.cands = cands
+        self.list.setRowCount(len(cands))
+        for r, (s, c) in enumerate(cands):
+            up = (c.get("uploader") or {}).get("name", "")
+            cells = [f"{s:.2f}", c["name"], up, str(c.get("version") or ""),
+                     "adult" if c.get("adultContent") else ""]
+            for col, text in enumerate(cells):
+                it = QTableWidgetItem(text)
+                if col == 0 and s >= 0.85:
+                    it.setForeground(QColor("#33aa55"))
+                elif col == 0 and s < 0.6:
+                    it.setForeground(QColor("#999999"))
+                self.list.setItem(r, col, it)
+        msg = f"{len(cands)} candidati" if cands else "nessun candidato: prova altre parole"
+        if errs:
+            msg += " - " + "; ".join(errs)
+        self.info.setText(msg)
+        self.btn_ok.setEnabled(bool(cands))
+        if cands:
+            self.list.selectRow(0)
+
+    def selected(self):
+        r = self.list.currentRow()
+        return self.cands[r][1] if 0 <= r < len(self.cands) else None
+
+    def open_selected(self):
+        c = self.selected()
+        if c:
+            QDesktopServices.openUrl(
+                QUrl(f"https://www.nexusmods.com/baldursgate3/mods/{c['modId']}"))
+
+    def accept_choice(self):
+        c = self.selected()
+        if c:
+            self.chosen = c
+            self.accept()
+
+
+class AccountWorker(QThread):
+    """Chiede a Nexus se l'account e' premium (risposta in cache 24h)."""
+    done = Signal(dict)
+
+    def __init__(self, api_key):
+        super().__init__()
+        self.api_key = api_key
+
+    def run(self):
+        try:
+            self.done.emit(core.nexus_user_info(self.api_key))
+        except Exception:
+            self.done.emit({})
+
+
+class UpdateWorker(QThread):
+    """Scarica e installa gli aggiornamenti: rete + I/O, fuori dalla UI."""
+    row_done = Signal(str, str)
+    finished_all = Signal(str)
+
+    def __init__(self, mods):
+        super().__init__()
+        self.mods = mods
+
+    def run(self):
+        cfg = core.load_config()
+        ok = fail = 0
+        for m in self.mods:
+            entry = cfg["mods"].get(m.uuid, {})
+            self.row_done.emit(m.uuid, "aggiornamento...")
+            try:
+                good, res = core.update_mod(
+                    m, entry, cfg["nexus_api_key"],
+                    log=lambda s, u=m.uuid: self.row_done.emit(u, s.strip()))
+            except Exception as ex:
+                good, res = False, f"errore: {ex}"
+            self.row_done.emit(m.uuid, res)
+            ok += good
+            fail += not good
+            core.save_config(cfg)
+        self.finished_all.emit(f"aggiornate {ok}, non aggiornate {fail}")
+
+
+class DiscoverWorker(QThread):
+    """Hash MD5 + lookup su Nexus: entrambi lenti, fuori dalla UI."""
+    row_done = Signal(str, str)
+    finished_all = Signal(str)
+
+    def __init__(self, mods):
+        super().__init__()
+        self.mods = mods
+
+    def run(self):
+        cfg = core.load_config()
+        found = miss = err = 0
+        for m in self.mods:
+            self.row_done.emit(m.uuid, "hash...")
+            try:
+                digest = core.file_md5(m.pak)
+            except OSError as ex:
+                self.row_done.emit(m.uuid, f"errore: {ex}")
+                err += 1
+                continue
+            try:
+                res = core.nexus_get(f"/mods/md5_search/{digest}.json",
+                                     cfg["nexus_api_key"])
+                info = res[0]["mod"]
+            except core.NexusError as ex:
+                if "404" in str(ex) or "non trovata" in str(ex):
+                    self.row_done.emit(m.uuid, "non su Nexus")
+                    miss += 1
+                else:
+                    self.row_done.emit(m.uuid, f"errore: {ex}")
+                    err += 1
+                continue
+            except (KeyError, IndexError, TypeError):
+                self.row_done.emit(m.uuid, "risposta inattesa")
+                miss += 1
+                continue
+            cfg["mods"].setdefault(m.uuid, {}).update(
+                {"nexus_id": info["mod_id"], "name": m.name,
+                 "installed_version": (info.get("version") or "").strip() or m.version})
+            self.row_done.emit(m.uuid, f"id {info['mod_id']}")
+            found += 1
+        core.save_config(cfg)
+        self.finished_all.emit(
+            f"identificate {found}, non trovate {miss}" + (f", errori {err}" if err else ""))
+
+
+class SetupDialog(QDialog):
+    """Wizard iniziale: sceglie la cartella dati di BG3.
+
+    Serve quando il rilevamento automatico non trova nulla, e in generale sotto
+    Flatpak, dove la sandbox puo' impedire di vedere i prefix: li' l'utente deve
+    poter indicare il percorso a mano.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("pakrat - configurazione")
+        self.resize(760, 420)
+        self.chosen = None
+
+        lay = QVBoxLayout(self)
+        intro = QLabel(
+            "<b>Dov'e' installato Baldur's Gate 3?</b><br>"
+            "Serve la cartella <i>dati</i> di Larian, quella che contiene "
+            "<tt>Mods/</tt> e <tt>PlayerProfiles/</tt> — non quella di installazione "
+            "del gioco.")
+        intro.setTextFormat(Qt.RichText)
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        self.list = QTableWidget(0, 2)
+        self.list.setHorizontalHeaderLabels(["Percorso", "Mod"])
+        self.list.verticalHeader().setVisible(False)
+        self.list.setSelectionBehavior(QTableWidget.SelectRows)
+        self.list.setSelectionMode(QTableWidget.SingleSelection)
+        self.list.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.list.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.list.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.list.doubleClicked.connect(self.use_selected)
+        lay.addWidget(self.list)
+
+        prow = QHBoxLayout()
+        self.path_box = QLineEdit()
+        self.path_box.setPlaceholderText("...oppure incolla qui un percorso")
+        self.path_box.returnPressed.connect(self.use_typed)
+        btn_browse = QPushButton("Sfoglia...")
+        btn_browse.clicked.connect(self.browse)
+        prow.addWidget(self.path_box)
+        prow.addWidget(btn_browse)
+        lay.addLayout(prow)
+
+        self.info = QLabel("")
+        self.info.setWordWrap(True)
+        lay.addWidget(self.info)
+
+        brow = QHBoxLayout()
+        btn_rescan = QPushButton("Ricerca di nuovo")
+        btn_rescan.clicked.connect(self.rescan)
+        self.btn_ok = QPushButton("Usa questa cartella")
+        self.btn_ok.clicked.connect(self.use_selected)
+        btn_quit = QPushButton("Esci")
+        btn_quit.clicked.connect(self.reject)
+        brow.addWidget(btn_rescan)
+        brow.addStretch()
+        brow.addWidget(btn_quit)
+        brow.addWidget(self.btn_ok)
+        lay.addLayout(brow)
+
+        self.rescan()
+
+    def rescan(self):
+        found = core.detect_larian_dirs()
+        self.found = found
+        self.list.setRowCount(len(found))
+        for r, p in enumerate(found):
+            mods = os.path.join(p, "Mods")
+            n = len([f for f in os.listdir(mods)
+                     if f.lower().endswith(".pak")]) if os.path.isdir(mods) else 0
+            self.list.setItem(r, 0, QTableWidgetItem(p))
+            self.list.setItem(r, 1, QTableWidgetItem(str(n)))
+        if found:
+            self.list.selectRow(0)
+            self.info.setText(f"{len(found)} installazioni trovate. "
+                              "Scegline una, oppure indica un percorso a mano.")
+        else:
+            self.info.setText("Nessuna installazione trovata automaticamente. "
+                              "Indica il percorso a mano qui sotto.")
+        self.btn_ok.setEnabled(bool(found))
+
+    def browse(self):
+        d = QFileDialog.getExistingDirectory(
+            self, "Cartella dati di Baldur's Gate 3", os.path.expanduser("~"))
+        if d:
+            self.path_box.setText(d)
+            self.use_typed()
+
+    def _apply(self, path):
+        ok, msg = core.set_larian_dir(path)
+        if ok:
+            self.chosen = msg
+            self.accept()
+        else:
+            self.info.setText(f"<span style='color:#cc5555'>{msg}</span>")
+            self.info.setTextFormat(Qt.RichText)
+
+    def use_typed(self):
+        p = self.path_box.text().strip()
+        if p:
+            self._apply(p)
+
+    def use_selected(self):
+        p = self.path_box.text().strip()
+        if p:
+            self._apply(p)
+            return
+        r = self.list.currentRow()
+        if 0 <= r < len(self.found):
+            self._apply(self.found[r])
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("pakrat")
+        self.resize(940, 620)
+        self.state = []
+        self.dirty = False
+        self.nexus_status = {}
+        self.worker = None
+        self.acct_worker = None
+        self.account = {}
+
+        central = QWidget()
+        layout = QVBoxLayout(central)
+
+        self.table = QTableWidget(0, len(HEADERS))
+        self.table.setHorizontalHeaderLabels(HEADERS)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        h = self.table.horizontalHeader()
+        h.setSectionResizeMode(COL_ON, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(COL_NUM, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(COL_NAME, QHeaderView.Stretch)
+        h.setSectionResizeMode(COL_VER, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(COL_AUTHOR, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(COL_NEXUS, QHeaderView.ResizeToContents)
+        layout.addWidget(self.table)
+
+        bar = QHBoxLayout()
+        self.btn_up = QPushButton("Su")
+        self.btn_down = QPushButton("Giu")
+        self.btn_add = QPushButton("Aggiungi .pak...")
+        self.btn_del = QPushButton("Elimina")
+        self.btn_match = QPushButton("Associa a Nexus...")
+        self.btn_match.setToolTip("Cerca la mod selezionata su Nexus e scegli fra i candidati.\n"
+                                  "Serve per abilitare aggiornamenti e download.")
+        self.btn_match.clicked.connect(self.match_selected)
+        self.btn_key = QPushButton()
+        self.btn_key.clicked.connect(self.set_apikey)
+        self.btn_browse = QPushButton("Apri nel browser")
+        self.btn_browse.setToolTip("Apre nexusmods.com nel browser di sistema.\n"
+                                   "Sulla pagina della mod selezionata se associata,\n"
+                                   "altrimenti sull'elenco mod di Baldur's Gate 3.")
+        self.btn_browse.clicked.connect(self.browse_nexus)
+        self.btn_check = QPushButton("Controlla aggiornamenti")
+        self.btn_update = QPushButton("Aggiorna")
+        self.btn_update.setToolTip("Scarica e installa l'ultima versione da Nexus.\n"
+                                   "Solo la mod selezionata, o tutte se non c'e' selezione.")
+        self.btn_update.clicked.connect(self.do_update)
+        self.btn_save = QPushButton("Salva load order")
+        self.btn_up.clicked.connect(lambda: self.move_sel(-1))
+        self.btn_down.clicked.connect(lambda: self.move_sel(1))
+        self.btn_add.clicked.connect(self.add_pak)
+        self.btn_del.clicked.connect(self.delete_sel)
+        self.btn_check.clicked.connect(self.check_updates)
+        self.btn_save.clicked.connect(self.save)
+        for b in (self.btn_up, self.btn_down, self.btn_add, self.btn_del, self.btn_match):
+            bar.addWidget(b)
+        bar.addStretch()
+        self.lbl_acct = QLabel("")
+        self.lbl_acct.setStyleSheet("color: palette(mid); padding-right: 8px;")
+        bar.addWidget(self.lbl_acct)
+        bar.addWidget(self.btn_key)
+        bar.addWidget(self.btn_browse)
+        bar.addWidget(self.btn_check)
+        bar.addWidget(self.btn_update)
+        bar.addWidget(self.btn_save)
+        layout.addLayout(bar)
+
+        self.setCentralWidget(central)
+        self.setStatusBar(QStatusBar())
+        self.setAcceptDrops(True)
+        self._build_menu()
+        self.reload()
+
+    # ------------------------------------------------------------ menu ---
+    def _build_menu(self):
+        m = self.menuBar().addMenu("&File")
+        a = QAction("Ricarica", self); a.setShortcut(QKeySequence("F5"))
+        a.triggered.connect(self.reload); m.addAction(a)
+        a = QAction("Salva load order", self); a.setShortcut(QKeySequence.Save)
+        a.triggered.connect(self.save); m.addAction(a)
+        m.addSeparator()
+        a = QAction("Cartella di gioco...", self)
+        a.triggered.connect(self.change_game_dir); m.addAction(a)
+        a = QAction("Ripristina backup...", self)
+        a.triggered.connect(self.restore_backup); m.addAction(a)
+        m.addSeparator()
+        a = QAction("Esci", self); a.setShortcut(QKeySequence.Quit)
+        a.triggered.connect(self.close); m.addAction(a)
+
+        n = self.menuBar().addMenu("&Nexus")
+        a = QAction("Imposta API key...", self)
+        a.triggered.connect(self.set_apikey); n.addAction(a)
+        a = QAction("Identifica mod via hash MD5...", self)
+        a.setToolTip("Cerca su Nexus le mod non ancora associate, usando l'hash del .pak")
+        a.triggered.connect(self.discover_nexus); n.addAction(a)
+        a = QAction("Associa a Nexus la mod selezionata...", self)
+        a.setShortcut(QKeySequence("Ctrl+F"))
+        a.triggered.connect(self.match_selected); n.addAction(a)
+        a = QAction("Associa per ID/URL...", self)
+        a.triggered.connect(self.link_nexus); n.addAction(a)
+        a = QAction("Aggiorna dalle versioni su Nexus", self)
+        a.triggered.connect(self.do_update); n.addAction(a)
+        a = QAction("Registra handler nxm://", self)
+        a.triggered.connect(self.install_handler); n.addAction(a)
+
+    # ----------------------------------------------------------- dati ---
+    def reload(self):
+        self.state, errors = core.build_state()
+        self.nexus_status = {}
+        self.dirty = False
+        self.refresh_key_button()
+        self.refresh_account()
+        self.refresh_table()
+        n_on = len([m for m in self.state if m.enabled])
+        msg = f"{n_on} mod attive su {len(self.state)}"
+        if errors:
+            msg += f" - {len(errors)} avvisi: " + "; ".join(errors)
+        self.statusBar().showMessage(msg)
+
+    def refresh_key_button(self):
+        """Mostra sul pulsante se la API key c'e' o manca."""
+        try:
+            key = core.load_config()["nexus_api_key"]
+        except SystemExit:
+            key = ""
+        if key:
+            self.btn_key.setText("API key ✓")
+            self.btn_key.setToolTip(f"API key Nexus configurata ({key[:6]}...).\n"
+                                    "Clicca per sostituirla.")
+        else:
+            self.btn_key.setText("Imposta API key...")
+            self.btn_key.setToolTip("Serve per il controllo aggiornamenti e i download.\n"
+                                    "nexusmods.com -> Site preferences -> API Keys")
+        self.btn_check.setEnabled(bool(key))
+        self.btn_update.setEnabled(bool(key))
+        return bool(key)
+
+    def refresh_table(self):
+        self.table.setRowCount(len(self.state))
+        pos = 0
+        for row, m in enumerate(self.state):
+            cb = QCheckBox()
+            cb.setChecked(m.enabled)
+            cb.setEnabled(not m.is_base and m.has_pak)
+            cb.stateChanged.connect(lambda st, mm=m: self.toggle(mm, st))
+            holder = QWidget()
+            lay = QHBoxLayout(holder)
+            lay.setContentsMargins(6, 0, 0, 0)
+            lay.addWidget(cb)
+            self.table.setCellWidget(row, COL_ON, holder)
+
+            if m.enabled:
+                pos += 1
+                num = str(pos)
+            else:
+                num = "-"
+            if m.is_base:
+                # non sono mod: vengono col gioco e su Nexus non esistono
+                author = "modulo base del gioco"
+                nexus = "no"
+            else:
+                author = m.author
+                nexus = self.nexus_status.get(m.uuid, "")
+            cells = [num, m.name, m.version, author, nexus]
+            for off, text in enumerate(cells, start=COL_NUM):
+                it = QTableWidgetItem(text)
+                if off in (COL_NUM, COL_VER):
+                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if m.is_base:
+                    it.setForeground(QColor("#6699cc"))
+                elif m.enabled and not m.has_pak:
+                    it.setForeground(QColor("#cc5555"))
+                elif not m.enabled:
+                    it.setForeground(QColor("#999999"))
+                if off == COL_NEXUS and text.startswith("aggiornamento"):
+                    it.setForeground(QColor("#ddaa33"))
+                self.table.setItem(row, off, it)
+        self.setWindowTitle("pakrat" + (" *" if self.dirty else ""))
+
+    def sel_row(self):
+        r = self.table.currentRow()
+        return r if 0 <= r < len(self.state) else -1
+
+    # ---------------------------------------------------------- azioni ---
+    def toggle(self, mod, st):
+        mod.enabled = bool(st)
+        self.dirty = True
+        self.refresh_table()
+
+    def move_sel(self, delta):
+        r = self.sel_row()
+        if r < 0:
+            return
+        j = r + delta
+        if not (0 <= j < len(self.state)):
+            return
+        if self.state[r].is_base or self.state[j].is_base:
+            self.statusBar().showMessage("i moduli base restano in testa")
+            return
+        self.state[r], self.state[j] = self.state[j], self.state[r]
+        self.dirty = True
+        self.refresh_table()
+        self.table.selectRow(j)
+
+    def add_pak(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Scegli un .pak", os.path.expanduser("~/Downloads"),
+            "Mod BG3 (*.pak)")
+        if path:
+            self.install(path)
+
+    def install(self, path):
+        ok, res = core.install_pak(path)
+        self.statusBar().showMessage(res)
+        if ok:
+            self.reload()
+        else:
+            QMessageBox.warning(self, "Installazione non riuscita", res)
+
+    def delete_sel(self):
+        r = self.sel_row()
+        if r < 0:
+            return
+        m = self.state[r]
+        if m.is_base:
+            QMessageBox.information(self, "pakrat", "Non si elimina un modulo base del gioco.")
+            return
+        if not m.has_pak:
+            self.state.pop(r)
+            self.dirty = True
+            self.refresh_table()
+            return
+        if QMessageBox.question(
+                self, "Eliminare la mod?",
+                f"Verra' cancellato il file:\n{m.pak}\n\nProcedere?") != QMessageBox.Yes:
+            return
+        try:
+            os.remove(m.pak)
+        except OSError as ex:
+            QMessageBox.critical(self, "Errore", str(ex))
+            return
+        self.state.pop(r)
+        self.dirty = True
+        self.refresh_table()
+        self.statusBar().showMessage(f"eliminato {m.name}")
+
+    def save(self):
+        ok, res = core.write_modsettings(self.state)
+        if ok:
+            self.dirty = False
+            self.refresh_table()
+            self.statusBar().showMessage("salvato: " + res)
+        else:
+            QMessageBox.critical(self, "Non salvato", res)
+
+    def change_game_dir(self):
+        dlg = SetupDialog(self)
+        if dlg.exec() == QDialog.Accepted and dlg.chosen:
+            self.reload()
+            self.statusBar().showMessage(f"cartella di gioco: {dlg.chosen}")
+
+    def restore_backup(self):
+        d = core.BACKUP_DIR
+        if not os.path.isdir(d) or not os.listdir(d):
+            QMessageBox.information(self, "pakrat", "Nessun backup disponibile.")
+            return
+        files = sorted((f for f in os.listdir(d) if f.startswith("modsettings-")),
+                       reverse=True)
+        item, ok = QInputDialog.getItem(self, "Ripristina backup",
+                                        "Backup da ripristinare:", files, 0, False)
+        if ok and item:
+            import shutil
+            core.backup_modsettings()
+            shutil.copy2(os.path.join(d, item), core.MODSETTINGS)
+            self.reload()
+            self.statusBar().showMessage(f"ripristinato {item}")
+
+    # ----------------------------------------------------------- nexus ---
+    def set_apikey(self):
+        cfg = core.load_config()
+        key, ok = QInputDialog.getText(
+            self, "API key Nexus",
+            "Personal API Key (nexusmods.com -> Site preferences -> API Keys):",
+            text=cfg["nexus_api_key"])
+        if ok:
+            key = key.strip()
+            if len(key) < 20:
+                QMessageBox.warning(self, "pakrat", "La chiave sembra incompleta.")
+                return
+            cfg["nexus_api_key"] = key
+            core.save_config(cfg)
+            cfg2 = core.load_config(); cfg2.pop("account", None); core.save_config(cfg2)
+            self.refresh_key_button()
+            self.refresh_account()
+            self.statusBar().showMessage("API key salvata")
+
+    def link_nexus(self):
+        r = self.sel_row()
+        if r < 0:
+            return
+        m = self.state[r]
+        ref, ok = QInputDialog.getText(
+            self, "Associa a Nexus",
+            f"URL o ID Nexus per '{m.name}':")
+        if not ok or not ref.strip():
+            return
+        try:
+            nid = core.parse_nexus_ref(ref)
+        except core.NexusError as ex:
+            QMessageBox.warning(self, "pakrat", str(ex))
+            return
+        cfg = core.load_config()
+        cfg["mods"].setdefault(m.uuid, {}).update({"nexus_id": nid, "name": m.name})
+        core.save_config(cfg)
+        self.nexus_status[m.uuid] = f"id {nid}"
+        self.refresh_table()
+
+    def browse_nexus(self):
+        """Apre Nexus: la pagina della mod selezionata se associata, altrimenti
+        l'elenco mod di Baldur's Gate 3."""
+        url = "https://www.nexusmods.com/baldursgate3/mods/"
+        what = "elenco mod di BG3"
+        r = self.sel_row()
+        if r >= 0:
+            m = self.state[r]
+            try:
+                cfg = core.load_config()
+            except SystemExit:
+                cfg = {"mods": {}}
+            nid = cfg.get("mods", {}).get(m.uuid, {}).get("nexus_id")
+            if nid:
+                url = f"https://www.nexusmods.com/baldursgate3/mods/{nid}"
+                what = m.name
+        if not QDesktopServices.openUrl(QUrl(url)):
+            QMessageBox.warning(self, "pakrat",
+                                f"Impossibile aprire il browser.\nURL: {url}")
+            return
+        self.statusBar().showMessage(f"aperto su Nexus: {what}")
+
+    def refresh_account(self):
+        """Interroga il tipo di account e adatta il pulsante di aggiornamento.
+
+        Una sola interfaccia per premium e free: cambia solo cosa fa il pulsante,
+        perche' gli account free non possono ottenere link diretti dall'API e
+        devono passare dal pulsante di download sul sito.
+        """
+        try:
+            cfg = core.load_config()
+        except SystemExit:
+            return
+        if not cfg["nexus_api_key"]:
+            self.account = {}
+            self.apply_account()
+            return
+        self.acct_worker = AccountWorker(cfg["nexus_api_key"])
+        self.acct_worker.done.connect(self.on_account)
+        self.acct_worker.start()
+
+    def on_account(self, acct):
+        self.account = acct or {}
+        self.apply_account()
+
+    def apply_account(self):
+        premium = bool(self.account.get("is_premium"))
+        name = self.account.get("name", "")
+        if not self.account:
+            self.btn_update.setText("Aggiorna")
+            self.btn_update.setToolTip("Imposta la API key per abilitare gli aggiornamenti.")
+            self.lbl_acct.setText("")
+            return
+        if premium:
+            self.btn_update.setText("Aggiorna")
+            self.btn_update.setToolTip(
+                "Scarica e installa l'ultima versione da Nexus.\n"
+                "Account premium: download diretto, senza browser.")
+            self.lbl_acct.setText(f"{name} · premium")
+        else:
+            self.btn_update.setText("Aggiorna (via browser)")
+            self.btn_update.setToolTip(
+                "Account non premium: Nexus non rilascia link diretti all'API.\n"
+                "Si apre la pagina della mod, tu clicchi 'Mod Manager Download'\n"
+                "e il download viene raccolto automaticamente.")
+            self.lbl_acct.setText(f"{name} · account free")
+
+    def update_via_browser(self, pool):
+        """Percorso per account free: apre le pagine di download delle mod."""
+        cfg = core.load_config()
+        if not os.path.exists(os.path.expanduser(
+                "~/.local/share/applications/pakrat-nxm.desktop")):
+            r = QMessageBox.question(
+                self, "Handler nxm:// non registrato",
+                "Per raccogliere i download dal browser serve l'handler nxm://.\n"
+                "Lo registro adesso?")
+            if r == QMessageBox.Yes:
+                self.install_handler()
+        opened = 0
+        for m in pool[:5]:          # non sommergere l'utente di schede
+            nid = cfg["mods"].get(m.uuid, {}).get("nexus_id")
+            if not nid:
+                continue
+            QDesktopServices.openUrl(QUrl(core.mod_file_page_url(nid)))
+            opened += 1
+        rest = max(0, len([m for m in pool if cfg["mods"].get(m.uuid, {}).get("nexus_id")]) - opened)
+        msg = (f"aperte {opened} pagine: clicca 'Mod Manager Download' su ciascuna, "
+               "il resto e' automatico")
+        if rest:
+            msg += f" ({rest} rimanenti, rilancia dopo)"
+        self.statusBar().showMessage(msg)
+
+    def do_update(self):
+        """Scarica e installa gli aggiornamenti delle mod associate a Nexus."""
+        if self.worker and self.worker.isRunning():
+            return
+        try:
+            cfg = core.load_config()
+        except SystemExit as ex:
+            QMessageBox.critical(self, "pakrat", str(ex))
+            return
+        if not cfg["nexus_api_key"]:
+            QMessageBox.information(self, "pakrat", "Prima imposta la API key Nexus.")
+            return
+        r = self.sel_row()
+        sel = self.state[r] if r >= 0 else None
+        if sel is not None and cfg["mods"].get(sel.uuid, {}).get("nexus_id"):
+            pool, what = [sel], f"'{sel.name}'"
+        else:
+            pool = [m for m in self.state
+                    if m.has_pak and cfg["mods"].get(m.uuid, {}).get("nexus_id")]
+            what = f"tutte le {len(pool)} mod associate"
+        if not pool:
+            QMessageBox.information(
+                self, "pakrat",
+                "Nessuna mod associata a Nexus.\nUsa 'Associa a Nexus...' per collegarle.")
+            return
+        if not self.account.get("is_premium", False):
+            self.update_via_browser(pool)
+            return
+        if QMessageBox.question(
+                self, "Aggiornare?",
+                f"Scarico e installo l'ultima versione di {what}.\n\n"
+                "Il .pak esistente viene sostituito solo se quello scaricato ha lo\n"
+                "stesso UUID, cosi' il load order resta valido.\n\nProcedere?"
+        ) != QMessageBox.Yes:
+            return
+        self.btn_update.setEnabled(False)
+        self.btn_check.setEnabled(False)
+        self.statusBar().showMessage("aggiornamento in corso...")
+        self.worker = UpdateWorker(pool)
+        self.worker.row_done.connect(self.on_row_done)
+        self.worker.finished_all.connect(self.on_update_done)
+        self.worker.start()
+
+    def on_update_done(self, msg):
+        self.btn_update.setEnabled(True)
+        self.btn_check.setEnabled(True)
+        self.statusBar().showMessage(msg)
+        keep = dict(self.nexus_status)
+        self.reload()
+        self.nexus_status = keep
+        self.refresh_table()
+
+    def match_selected(self):
+        """Cerca su Nexus la mod selezionata e fa scegliere fra i candidati."""
+        r = self.sel_row()
+        if r < 0:
+            QMessageBox.information(self, "pakrat", "Seleziona prima una mod.")
+            return
+        m = self.state[r]
+        if m.is_base:
+            QMessageBox.information(self, "pakrat",
+                                    "I moduli base del gioco non stanno su Nexus.")
+            return
+        try:
+            cfg = core.load_config()
+        except SystemExit as ex:
+            QMessageBox.critical(self, "pakrat", str(ex))
+            return
+        if not cfg["nexus_api_key"]:
+            QMessageBox.information(self, "pakrat", "Prima imposta la API key Nexus.")
+            return
+        dlg = MatchDialog(self, m, cfg["nexus_api_key"])
+        if dlg.exec() == QDialog.Accepted and dlg.chosen:
+            c = dlg.chosen
+            cfg = core.load_config()
+            cfg["mods"].setdefault(m.uuid, {}).update(
+                {"nexus_id": c["modId"], "name": m.name,
+                 "installed_version": m.version,
+                 "remote_version": (c.get("version") or "").strip()})
+            core.save_config(cfg)
+            self.nexus_status[m.uuid] = f"id {c['modId']}"
+            self.refresh_table()
+            self.statusBar().showMessage(f"{m.name} associata a mods/{c['modId']}")
+
+    def discover_nexus(self):
+        """Identifica via MD5 le mod non ancora associate a Nexus."""
+        if self.worker and self.worker.isRunning():
+            return
+        try:
+            cfg = core.load_config()
+        except SystemExit as ex:
+            QMessageBox.critical(self, "pakrat", str(ex))
+            return
+        if not cfg["nexus_api_key"]:
+            QMessageBox.information(self, "pakrat",
+                                    "Prima imposta la API key Nexus.")
+            return
+        todo = [m for m in self.state
+                if m.has_pak and not m.is_base
+                and not cfg["mods"].get(m.uuid, {}).get("nexus_id")]
+        if not todo:
+            QMessageBox.information(self, "pakrat",
+                                    "Tutte le mod con un .pak sono gia' associate.")
+            return
+        mb = sum(os.path.getsize(m.pak) for m in todo) / (1 << 20)
+        if QMessageBox.question(
+                self, "Identifica via MD5",
+                f"Calcolo l'hash di {len(todo)} mod ({mb:.0f} MB) e le cerco su Nexus.\n"
+                "Funziona per le mod pubblicate come .pak singolo; per quelle dentro\n"
+                "un archivio zip servira' l'associazione manuale.\n\nProcedere?"
+        ) != QMessageBox.Yes:
+            return
+        self.btn_check.setEnabled(False)
+        self.statusBar().showMessage("identificazione in corso...")
+        self.worker = DiscoverWorker(todo)
+        self.worker.row_done.connect(self.on_row_done)
+        self.worker.finished_all.connect(self.on_check_done)
+        self.worker.start()
+
+    def check_updates(self):
+        if self.worker and self.worker.isRunning():
+            return
+        self.btn_check.setEnabled(False)
+        self.statusBar().showMessage("controllo aggiornamenti in corso...")
+        self.worker = CheckWorker(list(self.state))
+        self.worker.row_done.connect(self.on_row_done)
+        self.worker.finished_all.connect(self.on_check_done)
+        self.worker.start()
+
+    def on_row_done(self, uuid, text):
+        self.nexus_status[uuid] = text
+        self.refresh_table()
+
+    def on_check_done(self, msg):
+        self.btn_check.setEnabled(True)
+        self.statusBar().showMessage(msg)
+
+    def install_handler(self):
+        import subprocess
+        r = subprocess.run([CORE_PATH, "handler"], capture_output=True, text=True)
+        QMessageBox.information(self, "Handler nxm://",
+                                (r.stdout or "") + (r.stderr or ""))
+
+    # ------------------------------------------------------ drag & drop ---
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls() and any(
+                u.toLocalFile().lower().endswith(".pak") for u in e.mimeData().urls()):
+            e.acceptProposedAction()
+
+    def dropEvent(self, e):
+        for u in e.mimeData().urls():
+            p = u.toLocalFile()
+            if p.lower().endswith(".pak"):
+                self.install(p)
+
+    def closeEvent(self, e):
+        if self.dirty:
+            r = QMessageBox.question(
+                self, "Modifiche non salvate",
+                "Il load order e' stato modificato ma non salvato.\nSalvare prima di uscire?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+            if r == QMessageBox.Cancel:
+                e.ignore()
+                return
+            if r == QMessageBox.Save:
+                self.save()
+        e.accept()
+
+
+def main():
+    app = QApplication(sys.argv)
+    app.setApplicationName("pakrat")
+    if not core.LARIAN or not os.path.isdir(core.LARIAN):
+        # primo avvio, o installazione spostata: chiedi dov'e' il gioco
+        dlg = SetupDialog()
+        if dlg.exec() != QDialog.Accepted:
+            return 1
+    w = MainWindow()
+    w.show()
+    if os.environ.get("PAKRAT_SCREENSHOT"):
+        from PySide6.QtCore import QTimer
+        def shot():
+            w.grab().save(os.environ["PAKRAT_SCREENSHOT"])
+            app.quit()
+        QTimer.singleShot(600, shot)
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,1692 @@
+#!/usr/bin/env python3
+"""
+pakrat - gestore mod nativo Linux (niente Wine, niente mod manager di Windows).
+
+Baldur's Gate 3: legge i .pak (formato LSPK v18) per ricavarne i metadati e
+gestisce il load order scrivendo modsettings.lsx.
+MechWarrior 5: Mercenaries: vedi mw5.py, il backend dedicato.
+Ogni scrittura su un file del gioco e' preceduta da un backup automatico.
+
+Uso:
+  pakrat              TUI interattiva
+  pakrat list         elenco mod e load order
+  pakrat add FILE     installa un .pak
+  pakrat setup        configura la cartella di gioco
+  pakrat backups      elenca i backup di modsettings.lsx
+  pakrat restore N    ripristina un backup
+  pakrat mw5 ...      backend MechWarrior 5: Mercenaries (vedi: pakrat mw5 help)
+
+Copyright (C) 2026 Ruttolomeo
+SPDX-License-Identifier: GPL-3.0-or-later
+
+Questo programma e' software libero: puoi ridistribuirlo e/o modificarlo secondo
+i termini della GNU General Public License come pubblicata dalla Free Software
+Foundation, versione 3 o (a tua scelta) una successiva. E' distribuito nella
+speranza che sia utile, ma SENZA ALCUNA GARANZIA. Vedi il file LICENSE.
+"""
+import curses
+import json
+import os
+import shutil
+import struct
+import sys
+import time
+import zlib
+import xml.etree.ElementTree as ET
+from datetime import datetime
+
+import lz4.block
+
+# ---------------------------------------------------------------- percorsi ---
+def env_var(name):
+    """Legge PAKRAT_<name>, accettando ancora il vecchio BG3MODS_<name>.
+
+    Il tool si chiamava bg3mods finche' gestiva solo Baldur's Gate 3: chi ha
+    quelle variabili negli script o nel .zshrc non deve accorgersi del rename.
+    """
+    return os.environ.get("PAKRAT_" + name) or os.environ.get("BG3MODS_" + name)
+
+
+_OLD_CONFIG_DIR = os.path.expanduser("~/.config/bg3mods")
+CONFIG_DIR = os.path.expanduser(env_var("CONFIG_DIR") or "~/.config/pakrat")
+BACKUP_DIR = os.path.join(CONFIG_DIR, "backups")
+
+
+def _migrate_config_dir():
+    """Sposta ~/.config/bg3mods su ~/.config/pakrat al primo avvio dopo il rename.
+
+    Dentro ci sono la API key, le associazioni a Nexus e i backup di
+    modsettings.lsx: perderli sarebbe grave, quindi si sposta, non si ricrea.
+    """
+    # Se il percorso e' stato imposto a mano non e' la cartella di default: non
+    # e' una migrazione, e' una scelta dell'utente (o un test). Non toccare nulla.
+    if env_var("CONFIG_DIR"):
+        return
+    if os.path.isdir(CONFIG_DIR) or not os.path.isdir(_OLD_CONFIG_DIR):
+        return
+    try:
+        os.makedirs(os.path.dirname(CONFIG_DIR), exist_ok=True)
+        try:
+            os.rename(_OLD_CONFIG_DIR, CONFIG_DIR)
+            verbo = "spostato"
+        except OSError:                    # filesystem diversi: copia e conserva
+            shutil.copytree(_OLD_CONFIG_DIR, CONFIG_DIR)
+            verbo = ("copiato (l'originale resta in %s: contiene la API key, "
+                     "cancellalo quando hai verificato)" % _OLD_CONFIG_DIR)
+        sys.stderr.write(f"config {verbo}: {_OLD_CONFIG_DIR} -> {CONFIG_DIR}\n")
+    except OSError as ex:
+        sys.stderr.write(f"attenzione: config non migrato ({ex}); "
+                         f"spostalo a mano da {_OLD_CONFIG_DIR}\n")
+        return
+    # l'handler nxm:// punta ancora al vecchio eseguibile: va rigenerato
+    if os.path.isfile(os.path.expanduser(
+            "~/.local/share/applications/bg3mods-nxm.desktop")):
+        sys.stderr.write("l'handler nxm:// punta ancora a bg3mods: "
+                         "rilancia 'pakrat handler'\n")
+
+
+_migrate_config_dir()
+
+# Sotto-percorso della cartella dati di Larian dentro un prefix Wine/Proton.
+_LARIAN_SUB = "drive_c/users/steamuser/AppData/Local/Larian Studios/Baldur's Gate 3"
+_STEAM_APPID = "1086940"
+
+
+def _looks_like_larian(p):
+    return bool(p) and (os.path.isdir(os.path.join(p, "Mods"))
+                        or os.path.isfile(os.path.join(p, "PlayerProfiles/Public/modsettings.lsx")))
+
+
+def _steam_libraries():
+    """Legge libraryfolders.vdf per trovare tutte le librerie Steam."""
+    libs = []
+    for base in ("~/.local/share/Steam", "~/.steam/steam", "~/.steam/root"):
+        vdf = os.path.expanduser(os.path.join(base, "steamapps/libraryfolders.vdf"))
+        if not os.path.isfile(vdf):
+            continue
+        try:
+            import re
+            txt = open(vdf, encoding="utf-8", errors="replace").read()
+            libs += re.findall(r'"path"\s+"([^"]+)"', txt)
+        except OSError:
+            pass
+        libs.append(os.path.expanduser(base))
+    return libs
+
+
+def detect_larian_dirs():
+    """Cerca la cartella dati di BG3 nei posti dove finisce di solito.
+
+    Copre Steam (compatdata), Heroic, Lutris, Bottles e i prefix Wine generici.
+    Su installazioni non standard si usa la chiave 'larian_dir' nel config o la
+    variabile d'ambiente PAKRAT_LARIAN.
+    """
+    import glob
+    cands = []
+
+    env = env_var("LARIAN")
+    if env:
+        cands.append(os.path.expanduser(env))
+
+    # Steam: compatdata/1086940 in ogni libreria
+    for lib in _steam_libraries():
+        cands.append(os.path.join(lib, "steamapps/compatdata", _STEAM_APPID, "pfx", _LARIAN_SUB))
+
+    # Heroic / Lutris / Bottles / prefix generici
+    patterns = [
+        "~/Games/Heroic/Prefixes/*/*/" + _LARIAN_SUB,
+        "~/Games/Heroic/Prefixes/*/" + _LARIAN_SUB,
+        "~/.var/app/com.heroicgameslauncher.hgl/config/heroic/Prefixes/*/*/" + _LARIAN_SUB,
+        "/mnt/*/HeroicGames/Wine Prefixes/*/" + _LARIAN_SUB,
+        "/media/*/HeroicGames/Wine Prefixes/*/" + _LARIAN_SUB,
+        "~/Games/*/" + _LARIAN_SUB,
+        "~/.local/share/lutris/prefixes/*/" + _LARIAN_SUB,
+        "~/.var/app/com.usebottles.bottles/data/bottles/bottles/*/" + _LARIAN_SUB,
+        "~/.wine/" + _LARIAN_SUB,
+    ]
+    for pat in patterns:
+        cands += sorted(glob.glob(os.path.expanduser(pat)))
+
+    # Windows nativo, per completezza
+    if os.name == "nt":
+        la = os.environ.get("LOCALAPPDATA")
+        if la:
+            cands.append(os.path.join(la, "Larian Studios", "Baldur's Gate 3"))
+
+    seen, out = set(), []
+    for c in cands:
+        c = os.path.normpath(c)
+        if c not in seen and _looks_like_larian(c):
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def _resolve_larian():
+    # 1) config esplicito  2) rilevamento automatico  3) niente
+    try:
+        with open(os.path.join(CONFIG_DIR, "config.json")) as f:
+            cfg = json.load(f)
+        p = cfg.get("larian_dir")
+        if p and _looks_like_larian(os.path.expanduser(p)):
+            return os.path.expanduser(p)
+    except (OSError, json.JSONDecodeError):
+        pass
+    found = detect_larian_dirs()
+    return found[0] if found else ""
+
+
+LARIAN = _resolve_larian()
+MODS_DIR = os.path.join(LARIAN, "Mods") if LARIAN else ""
+MODSETTINGS = (os.path.join(LARIAN, "PlayerProfiles/Public/modsettings.lsx")
+               if LARIAN else "")
+
+
+def reload_paths():
+    """Rilegge i percorsi dopo che la configurazione e' cambiata."""
+    global LARIAN, MODS_DIR, MODSETTINGS
+    LARIAN = _resolve_larian()
+    MODS_DIR = os.path.join(LARIAN, "Mods") if LARIAN else ""
+    MODSETTINGS = (os.path.join(LARIAN, "PlayerProfiles/Public/modsettings.lsx")
+                   if LARIAN else "")
+    return LARIAN
+
+
+def validate_larian_dir(path):
+    """Controlla che il percorso sia la cartella dati di Larian.
+
+    Ritorna (ok, messaggio). Il messaggio spiega cosa manca, cosi' chi sbaglia
+    cartella capisce dove guardare invece di ricevere un no secco.
+    """
+    if not path:
+        return False, "nessun percorso indicato"
+    p = os.path.expanduser(path.strip())
+    if not os.path.exists(p):
+        return False, "il percorso non esiste"
+    if not os.path.isdir(p):
+        return False, "non e' una cartella"
+    has_mods = os.path.isdir(os.path.join(p, "Mods"))
+    has_prof = os.path.isdir(os.path.join(p, "PlayerProfiles"))
+    if not has_mods and not has_prof:
+        # errore tipico: si indica la cartella del gioco invece dei dati utente
+        if os.path.isdir(os.path.join(p, "bin")) or os.path.isdir(os.path.join(p, "Data")):
+            return False, ("questa e' la cartella di installazione del gioco. "
+                           "Serve quella dei dati utente, sotto "
+                           "AppData/Local/Larian Studios/Baldur's Gate 3")
+        return False, "qui non ci sono ne' Mods/ ne' PlayerProfiles/"
+    if not os.access(p, os.W_OK):
+        return False, "cartella non scrivibile"
+    note = ""
+    if not has_mods:
+        note = " (la cartella Mods/ verra' creata al primo .pak installato)"
+    return True, "ok" + note
+
+
+def set_larian_dir(path):
+    """Salva la cartella di gioco nel config e ricarica i percorsi."""
+    ok, msg = validate_larian_dir(path)
+    if not ok:
+        return False, msg
+    p = os.path.expanduser(path.strip())
+    cfg = load_config()
+    cfg["larian_dir"] = p
+    save_config(cfg)
+    reload_paths()
+    return True, p
+
+# Moduli base del gioco: presenti in modsettings ma senza .pak in Mods/.
+# Vanno lasciati in testa e mai rimossi, altrimenti il gioco non parte.
+BASE_MODULES = {"GustavX", "HonourX", "Gustav", "GustavDev", "Shared", "SharedDev"}
+
+ENTRY_SIZE = 272
+
+
+# ------------------------------------------------------------------- LSPK ---
+def _decompress(data, flags, uncompressed_size):
+    method = flags & 0x0F
+    if method == 0:
+        return data
+    if method == 1:
+        return zlib.decompress(data)
+    if method == 2:
+        return lz4.block.decompress(data, uncompressed_size=uncompressed_size)
+    raise ValueError(f"metodo di compressione sconosciuto: {method}")
+
+
+def pak_list_files(path):
+    with open(path, "rb") as f:
+        magic, version = struct.unpack("<4sI", f.read(8))
+        if magic != b"LSPK":
+            raise ValueError("non e' un archivio LSPK")
+        if version != 18:
+            raise ValueError(f"versione LSPK non supportata: {version}")
+        filelist_offset, _ = struct.unpack("<QI", f.read(12))
+
+        f.seek(filelist_offset)
+        num_files, compressed_size = struct.unpack("<II", f.read(8))
+        raw = lz4.block.decompress(f.read(compressed_size),
+                                   uncompressed_size=num_files * ENTRY_SIZE)
+        out = []
+        for i in range(num_files):
+            e = raw[i * ENTRY_SIZE:(i + 1) * ENTRY_SIZE]
+            name = e[:256].split(b"\x00")[0].decode("utf-8", "replace")
+            off1, off2, _part, flags, size_disk, size_unc = struct.unpack_from("<IHBBII", e, 256)
+            out.append((name, off1 | (off2 << 32), size_disk, size_unc, flags))
+        return out
+
+
+def pak_read_meta(path):
+    for name, offset, size_disk, size_unc, flags in pak_list_files(path):
+        if name.lower().endswith("meta.lsx"):
+            with open(path, "rb") as f:
+                f.seek(offset)
+                return _decompress(f.read(size_disk), flags, size_unc)
+    return None
+
+
+def decode_version64(v):
+    """Version64 di Larian -> stringa leggibile."""
+    try:
+        v = int(v)
+    except (TypeError, ValueError):
+        return "?"
+    if v == 0:
+        return "0.0.0.0"
+    return f"{v >> 55}.{(v >> 47) & 0xFF}.{(v >> 31) & 0xFFFF}.{v & 0x7FFFFFFF}"
+
+
+# ------------------------------------------------------------------- model ---
+class Mod:
+    def __init__(self, uuid, folder, name, version64, author="", pak=None,
+                 md5="", publish_handle="0", is_base=False):
+        self.uuid = uuid
+        self.folder = folder
+        self.name = name or folder
+        self.version64 = str(version64 or "0")
+        self.author = author
+        self.pak = pak
+        self.md5 = md5
+        self.publish_handle = publish_handle
+        self.is_base = is_base
+        self.enabled = False
+
+    @property
+    def version(self):
+        return decode_version64(self.version64)
+
+    @property
+    def has_pak(self):
+        return self.pak is not None and os.path.exists(self.pak)
+
+
+def _attrs(node):
+    out = {}
+    for a in node.findall("attribute"):
+        out[a.get("id")] = a.get("value")
+    return out
+
+
+def mod_from_pak(path):
+    meta = pak_read_meta(path)
+    if meta is None:
+        return None
+    text = meta.decode("utf-8-sig", "replace")
+    root = ET.fromstring(text)
+    for node in root.iter("node"):
+        if node.get("id") == "ModuleInfo":
+            a = _attrs(node)
+            uuid = a.get("UUID")
+            if not uuid:
+                return None
+            return Mod(uuid, a.get("Folder", ""), a.get("Name", ""),
+                       a.get("Version64") or a.get("Version") or "0",
+                       a.get("Author", ""), pak=path, md5=a.get("MD5", ""))
+    return None
+
+
+def scan_mods():
+    """Tutti i .pak presenti in Mods/, indicizzati per UUID."""
+    found = {}
+    errors = []
+    if not os.path.isdir(MODS_DIR):
+        return found, [f"cartella Mods non trovata: {MODS_DIR}"]
+    for fn in sorted(os.listdir(MODS_DIR)):
+        if not fn.lower().endswith(".pak"):
+            continue
+        p = os.path.join(MODS_DIR, fn)
+        try:
+            m = mod_from_pak(p)
+            if m is None:
+                errors.append(f"{fn}: nessun meta.lsx (probabile mod di override, non serve in modsettings)")
+            else:
+                found[m.uuid] = m
+        except Exception as ex:
+            errors.append(f"{fn}: {ex}")
+    return found, errors
+
+
+def read_modsettings():
+    """Ritorna la lista ordinata di Mod attivi come da modsettings.lsx."""
+    if not os.path.exists(MODSETTINGS):
+        return []
+    root = ET.parse(MODSETTINGS).getroot()
+    order = []
+    for node in root.iter("node"):
+        if node.get("id") != "Mods":
+            continue
+        children = node.find("children")
+        if children is None:
+            continue
+        for desc in children.findall("node"):
+            if desc.get("id") != "ModuleShortDesc":
+                continue
+            a = _attrs(desc)
+            uuid = a.get("UUID")
+            if not uuid:
+                continue
+            folder = a.get("Folder", "")
+            order.append(Mod(uuid, folder, a.get("Name", ""),
+                             a.get("Version64", "0"), md5=a.get("MD5", ""),
+                             publish_handle=a.get("PublishHandle", "0"),
+                             is_base=folder in BASE_MODULES))
+    return order
+
+
+def build_state():
+    """Fonde modsettings.lsx e i .pak presenti in un'unica lista ordinata."""
+    paks, errors = scan_mods()
+    active = read_modsettings()
+
+    state = []
+    seen = set()
+    for m in active:
+        seen.add(m.uuid)
+        pak = paks.get(m.uuid)
+        if pak is not None:
+            pak.enabled = True
+            pak.publish_handle = m.publish_handle
+            pak.md5 = m.md5 or pak.md5
+            state.append(pak)
+        else:
+            # attivo ma senza .pak: modulo base, oppure .pak cancellato
+            m.enabled = True
+            state.append(m)
+
+    for uuid, m in sorted(paks.items(), key=lambda kv: kv[1].name.lower()):
+        if uuid not in seen:
+            m.enabled = False
+            state.append(m)
+    return state, errors
+
+
+# ------------------------------------------------------------- scrittura ----
+LSX_HEADER = '''<?xml version="1.0" encoding="UTF-8"?>
+<save>
+    <version major="4" minor="8" revision="0" build="700"/>
+    <region id="ModuleSettings">
+        <node id="root">
+            <children>
+                <node id="Mods">
+                    <children>
+'''
+LSX_FOOTER = '''                    </children>
+                </node>
+            </children>
+        </node>
+    </region>
+</save>
+'''
+
+
+def _esc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def backup_modsettings():
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    if not os.path.exists(MODSETTINGS):
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(BACKUP_DIR, f"modsettings-{stamp}.lsx")
+    shutil.copy2(MODSETTINGS, dest)
+    # tiene gli ultimi 30
+    files = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith("modsettings-"))
+    for old in files[:-30]:
+        os.remove(os.path.join(BACKUP_DIR, old))
+    return dest
+
+
+def write_modsettings(state):
+    """Scrive il load order. Ritorna (ok, messaggio)."""
+    enabled = [m for m in state if m.enabled]
+    if not enabled:
+        return False, "rifiuto di scrivere: nessun modulo attivo"
+    # I moduli base devono esserci, altrimenti il gioco non parte.
+    if not any(m.is_base or m.folder in BASE_MODULES for m in enabled):
+        return False, "rifiuto di scrivere: mancano i moduli base del gioco"
+
+    body = []
+    for m in enabled:
+        body.append(
+            '                        <node id="ModuleShortDesc">\n'
+            f'                            <attribute id="Folder" type="LSString" value="{_esc(m.folder)}"/>\n'
+            f'                            <attribute id="MD5" type="LSString" value="{_esc(m.md5 or "")}"/>\n'
+            f'                            <attribute id="Name" type="LSString" value="{_esc(m.name)}"/>\n'
+            f'                            <attribute id="PublishHandle" type="uint64" value="{_esc(m.publish_handle or "0")}"/>\n'
+            f'                            <attribute id="UUID" type="guid" value="{_esc(m.uuid)}"/>\n'
+            f'                            <attribute id="Version64" type="int64" value="{_esc(m.version64)}"/>\n'
+            '                        </node>\n')
+    content = LSX_HEADER + "".join(body) + LSX_FOOTER
+
+    # validazione prima di toccare il file vero
+    try:
+        ET.fromstring(content)
+    except ET.ParseError as ex:
+        return False, f"XML generato non valido, non scrivo: {ex}"
+
+    bak = backup_modsettings()
+    tmp = MODSETTINGS + ".pakrat.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, MODSETTINGS)
+    n = len(enabled)
+    return True, f"scritte {n} voci" + (f" (backup: {os.path.basename(bak)})" if bak else "")
+
+
+def install_pak(src):
+    if not os.path.isfile(src):
+        return False, f"file non trovato: {src}"
+    if not src.lower().endswith(".pak"):
+        return False, "non e' un .pak"
+    try:
+        m = mod_from_pak(src)
+    except Exception as ex:
+        return False, f"pak illeggibile: {ex}"
+    dest = os.path.join(MODS_DIR, os.path.basename(src))
+    if os.path.exists(dest):
+        return False, f"esiste gia': {os.path.basename(dest)}"
+    shutil.copy2(src, dest)
+    if m is None:
+        return True, f"installato {os.path.basename(dest)} (senza meta.lsx: non va in modsettings)"
+    return True, f"installato {m.name} {m.version}"
+
+
+# ------------------------------------------------------------------ nexus ---
+# Il .pak non contiene l'ID Nexus della mod: senza quello non si puo' sapere
+# quale pagina interrogare. Lo si ricava dal link nxm:// (automatico) oppure
+# lo si registra a mano una volta con "pakrat link". La mappatura vive qui.
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+NEXUS_API_BASE = "https://api.nexusmods.com/v1/games"
+NEXUS_GAME = "baldursgate3"
+NEXUS_API = f"{NEXUS_API_BASE}/{NEXUS_GAME}"
+USER_AGENT = "pakrat/1.0"
+
+
+def load_config():
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        cfg = {}
+    except json.JSONDecodeError as ex:
+        raise SystemExit(f"config.json illeggibile ({ex}). Correggilo o cancellalo: {CONFIG_FILE}")
+    cfg.setdefault("nexus_api_key", "")
+    cfg.setdefault("mods", {})
+    return cfg
+
+
+def save_config(cfg):
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    tmp = CONFIG_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.chmod(tmp, 0o600)          # contiene la API key
+    os.replace(tmp, CONFIG_FILE)
+
+
+class NexusError(Exception):
+    pass
+
+
+def nexus_get(path, api_key, game=NEXUS_GAME):
+    """GET sull'API Nexus con messaggi d'errore leggibili.
+
+    'game' e' il domain Nexus del gioco: serve ai backend non-BG3 (vedi mw5.py).
+    """
+    import urllib.error
+    import urllib.request
+    if not api_key:
+        raise NexusError("API key non configurata: pakrat apikey INCOLLA_LA_CHIAVE")
+    req = urllib.request.Request(f"{NEXUS_API_BASE}/{game}{path}",
+                                 headers={"apikey": api_key, "User-Agent": USER_AGENT,
+                                          "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            remaining = r.headers.get("X-RL-Daily-Remaining")
+            if remaining is not None and remaining.isdigit() and int(remaining) < 20:
+                sys.stderr.write(f"attenzione: quota API Nexus quasi esaurita ({remaining} richieste)\n")
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as ex:
+        if ex.code == 401:
+            raise NexusError("API key rifiutata (401): controlla di averla copiata per intero")
+        if ex.code == 403:
+            raise NexusError("accesso negato (403): la mod potrebbe richiedere un account premium")
+        if ex.code == 404:
+            raise NexusError("mod non trovata (404): ID Nexus sbagliato o mod rimossa")
+        if ex.code == 429:
+            raise NexusError("quota API esaurita (429): riprova tra un'ora")
+        raise NexusError(f"errore HTTP {ex.code} da Nexus")
+    except urllib.error.URLError as ex:
+        raise NexusError(f"rete non raggiungibile: {ex.reason}")
+    except json.JSONDecodeError:
+        raise NexusError("risposta non valida da Nexus")
+
+
+def parse_nexus_ref(s):
+    """Accetta un ID nudo o un URL di Nexus, ritorna l'ID mod."""
+    s = s.strip()
+    if s.isdigit():
+        return int(s)
+    import re
+    m = re.search(r"baldursgate3/mods/(\d+)", s)
+    if m:
+        return int(m.group(1))
+    raise NexusError(f"non riesco a ricavare un ID Nexus da: {s}")
+
+
+def cmd_apikey(key):
+    key = key.strip()
+    if len(key) < 20:
+        print("chiave troppo corta: sembra incompleta", file=sys.stderr)
+        return 1
+    cfg = load_config()
+    cfg["nexus_api_key"] = key
+    save_config(cfg)
+    print(f"API key salvata in {CONFIG_FILE} (permessi 600)")
+    return 0
+
+
+def cmd_link(target, ref):
+    """Associa una mod installata al suo ID Nexus."""
+    state, _ = build_state()
+    mod = None
+    if target.isdigit():
+        i = int(target) - 1
+        if 0 <= i < len(state):
+            mod = state[i]
+    if mod is None:
+        for m in state:
+            if m.uuid == target or m.name.lower() == target.lower():
+                mod = m
+                break
+    if mod is None:
+        print(f"mod non trovata: {target}", file=sys.stderr)
+        return 1
+    try:
+        nexus_id = parse_nexus_ref(ref)
+    except NexusError as ex:
+        print(ex, file=sys.stderr)
+        return 1
+    cfg = load_config()
+    cfg["mods"].setdefault(mod.uuid, {})
+    cfg["mods"][mod.uuid].update({"nexus_id": nexus_id, "name": mod.name})
+    save_config(cfg)
+    print(f"{mod.name} -> nexusmods.com/baldursgate3/mods/{nexus_id}")
+    return 0
+
+
+NEXUS_GRAPHQL = "https://api.nexusmods.com/v2/graphql"
+
+# parole troppo comuni nei nomi delle mod per essere discriminanti
+_STOPWORDS = {"the", "of", "by", "a", "an", "set", "mod", "for", "and", "bg3",
+              "outfit", "version", "new", "my"}
+
+_GQL_SEARCH = """query($f:ModsFilter,$c:Int){
+  mods(filter:$f,count:$c,viewUserBlockedContent:true){
+    nodes{modId name version adultContent summary uploader{name}}}}"""
+
+
+def nexus_graphql(query, variables, api_key):
+    import urllib.error
+    import urllib.request
+    if not api_key:
+        raise NexusError("API key non configurata")
+    body = json.dumps({"query": query, "variables": variables}).encode()
+    req = urllib.request.Request(
+        NEXUS_GRAPHQL, data=body,
+        headers={"apikey": api_key, "Content-Type": "application/json",
+                 "User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            d = json.loads(r.read().decode())
+    except urllib.error.HTTPError as ex:
+        if ex.code == 401:
+            raise NexusError("API key rifiutata (401)")
+        if ex.code == 429:
+            raise NexusError("quota API esaurita (429)")
+        raise NexusError(f"errore HTTP {ex.code} da Nexus")
+    except urllib.error.URLError as ex:
+        raise NexusError(f"rete non raggiungibile: {ex.reason}")
+    except json.JSONDecodeError:
+        raise NexusError("risposta non valida da Nexus")
+    if "errors" in d:
+        raise NexusError(d["errors"][0].get("message", "errore GraphQL"))
+    return d.get("data", {})
+
+
+def nexus_search(term, api_key, count=25):
+    data = nexus_graphql(_GQL_SEARCH, {
+        "f": {"gameDomainName": [{"value": "baldursgate3", "op": "EQUALS"}],
+              "name": [{"value": term, "op": "WILDCARD"}]},
+        "c": count}, api_key)
+    return data.get("mods", {}).get("nodes", []) or []
+
+
+def _norm(s):
+    import re
+    return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
+
+
+def search_terms(name, folder=""):
+    """Genera qualche termine di ricerca da un nome di mod locale.
+
+    I nomi su Nexus differiscono spesso da quelli nel meta.lsx ("Queen Marika Set"
+    contro "Queen Marika Outfit By REN"), quindi si cercano sottoinsiemi corti
+    invece del nome intero. Il CamelCase va spezzato: 'BasketEquipmentNSFW' da
+    solo non trova nulla, 'Basket Equipment' si'.
+    """
+    import re
+    s = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name or "")
+    s = re.sub(r"[_\-:]+", " ", s)
+    words = re.findall(r"[A-Za-z0-9']+", s)
+    out = []
+    if len(words) >= 2:
+        out.append(" ".join(words[:2]))
+    sig = [w for w in words if w.lower() not in _STOPWORDS]
+    if sig:
+        out.append(sig[0])
+    if len(sig) >= 2:
+        out.append(" ".join(sig[:2]))
+    f = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", folder or "")
+    fw = [w for w in re.findall(r"[A-Za-z0-9']+", f) if w.lower() not in _STOPWORDS]
+    if fw:
+        out.append(fw[0])
+    seen, res = set(), []
+    for t in out:
+        if len(t) > 2 and t.lower() not in seen:
+            seen.add(t.lower())
+            res.append(t)
+    return res[:3]
+
+
+def match_score(mod, cand):
+    """0..1: somiglianza del nome, con bonus se l'autore coincide."""
+    import difflib
+    s = difflib.SequenceMatcher(None, _norm(mod.name), _norm(cand.get("name"))).ratio()
+    up = _norm((cand.get("uploader") or {}).get("name", ""))
+    au = _norm(mod.author)
+    if au and up and (au == up or au in up or up in au):
+        s = min(1.0, s + 0.25)
+    return s
+
+
+def find_candidates(mod, api_key, extra_term=None, limit=12):
+    """Cerca su Nexus i possibili corrispondenti di una mod locale, ordinati."""
+    terms = [extra_term] if extra_term else search_terms(mod.name, mod.folder)
+    cands = {}
+    errors = []
+    for t in terms:
+        try:
+            for n in nexus_search(t, api_key):
+                cands[n["modId"]] = n
+        except NexusError as ex:
+            errors.append(f"'{t}': {ex}")
+    ranked = sorted(cands.values(), key=lambda c: -match_score(mod, c))
+    return [(match_score(mod, c), c) for c in ranked[:limit]], errors
+
+
+def cmd_match(target=None):
+    """Associa le mod a Nexus scegliendo a mano fra i candidati trovati."""
+    cfg = load_config()
+    if not cfg["nexus_api_key"]:
+        print("API key non configurata: pakrat apikey LA_TUA_CHIAVE", file=sys.stderr)
+        return 1
+    state, _ = build_state()
+    pool = [m for m in state if m.has_pak and not m.is_base]
+    if target:
+        if target.isdigit() and 1 <= int(target) <= len(state):
+            pool = [state[int(target) - 1]]
+        else:
+            pool = [m for m in pool if target.lower() in m.name.lower()]
+        if not pool:
+            print(f"nessuna mod corrisponde a '{target}'", file=sys.stderr)
+            return 1
+    else:
+        pool = [m for m in pool if not cfg["mods"].get(m.uuid, {}).get("nexus_id")]
+        if not pool:
+            print("tutte le mod sono gia' associate")
+            return 0
+
+    for m in pool:
+        print(f"\n=== {m.name}   [autore locale: {m.author or '?'}]")
+        term = None
+        while True:
+            cands, errs = find_candidates(m, cfg["nexus_api_key"], extra_term=term)
+            for e in errs:
+                print("  avviso:", e)
+            if not cands:
+                print("  nessun candidato trovato")
+            for i, (s, c) in enumerate(cands, 1):
+                up = (c.get("uploader") or {}).get("name", "")
+                adult = " [adult]" if c.get("adultContent") else ""
+                print(f"  {i:2}) {s:.2f}  {c['name'][:44]:44} {up[:14]:14} "
+                      f"{str(c.get('version'))[:10]:10}{adult}")
+            print("   s) salta   c) cerca con altre parole   q) esci")
+            ans = input("  scelta: ").strip().lower()
+            if ans == "q":
+                return 0
+            if ans == "s" or ans == "":
+                break
+            if ans == "c":
+                term = input("  termine di ricerca: ").strip() or None
+                continue
+            if ans.isdigit() and 1 <= int(ans) <= len(cands):
+                c = cands[int(ans) - 1][1]
+                cfg["mods"].setdefault(m.uuid, {}).update(
+                    {"nexus_id": c["modId"], "name": m.name,
+                     "installed_version": m.version,
+                     "remote_version": (c.get("version") or "").strip()})
+                save_config(cfg)
+                print(f"  associata -> mods/{c['modId']} ({c['name']})")
+                break
+            print("  scelta non valida")
+    return 0
+
+
+def file_md5(path, chunk=1 << 20):
+    import hashlib
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def cmd_discover(only_missing=True):
+    """Tenta di ricavare gli ID Nexus dall'hash MD5 dei .pak.
+
+    Nexus indicizza l'hash del file caricato dall'autore: funziona se la mod e'
+    stata pubblicata come .pak nudo, non se e' dentro un archivio zip/7z (in quel
+    caso l'hash indicizzato e' quello dell'archivio, non del .pak estratto).
+    Le mod non identificate restano da associare a mano con 'pakrat link'.
+    """
+    cfg = load_config()
+    if not cfg["nexus_api_key"]:
+        print("API key non configurata: pakrat apikey LA_TUA_CHIAVE", file=sys.stderr)
+        return 1
+    state, _ = build_state()
+    targets = [m for m in state if m.has_pak and not m.is_base]
+    if only_missing:
+        targets = [m for m in targets
+                   if not cfg["mods"].get(m.uuid, {}).get("nexus_id")]
+    if not targets:
+        print("nessuna mod da identificare")
+        return 0
+
+    found = miss = err = 0
+    for m in targets:
+        size_mb = os.path.getsize(m.pak) / (1 << 20)
+        print(f"{m.name[:38]:38} calcolo hash ({size_mb:.0f} MB)...", end="", flush=True)
+        try:
+            digest = file_md5(m.pak)
+        except OSError as ex:
+            print(f" errore lettura: {ex}")
+            err += 1
+            continue
+        try:
+            res = nexus_get(f"/mods/md5_search/{digest}.json", cfg["nexus_api_key"])
+        except NexusError as ex:
+            # 404 = semplicemente nessuna corrispondenza, non un guasto
+            if "404" in str(ex) or "non trovata" in str(ex):
+                print(" nessuna corrispondenza")
+                miss += 1
+                continue
+            print(f" {ex}")
+            err += 1
+            continue
+        try:
+            mod_info = res[0]["mod"]
+            nexus_id = mod_info["mod_id"]
+            version = (mod_info.get("version") or "").strip()
+        except (KeyError, IndexError, TypeError):
+            print(" risposta inattesa")
+            miss += 1
+            continue
+        cfg["mods"].setdefault(m.uuid, {}).update(
+            {"nexus_id": nexus_id, "name": m.name,
+             "installed_version": version or m.version})
+        print(f" -> mods/{nexus_id} ({mod_info.get('name', '')[:30]})")
+        found += 1
+    save_config(cfg)
+    print(f"\nidentificate {found}, non trovate {miss}, errori {err}")
+    if miss:
+        print("per quelle non trovate: pakrat link N URL_DELLA_MOD")
+    return 0
+
+
+def _nexus_version_of(info):
+    return (info.get("version") or "").strip()
+
+
+def cmd_check():
+    """Confronta la versione locale con quella su Nexus, per le mod mappate."""
+    cfg = load_config()
+    state, _ = build_state()
+    mapped = [m for m in state if m.uuid in cfg["mods"] and cfg["mods"][m.uuid].get("nexus_id")]
+    unmapped = [m for m in state if not m.is_base and m.uuid not in cfg["mods"]]
+
+    if not cfg["nexus_api_key"]:
+        print("API key non configurata.")
+        print("  1) nexusmods.com -> Account -> Site preferences -> API Keys -> Personal API Key")
+        print("  2) pakrat apikey LA_TUA_CHIAVE")
+        return 1
+    if not mapped:
+        print("nessuna mod associata a un ID Nexus: usa 'pakrat link N URL' oppure")
+        print("scarica le mod col pulsante 'Mod Manager Download' dopo 'pakrat handler'.")
+        return 1
+
+    errors = 0
+    for m in mapped:
+        entry = cfg["mods"][m.uuid]
+        try:
+            info = nexus_get(f"/mods/{entry['nexus_id']}.json", cfg["nexus_api_key"])
+        except NexusError as ex:
+            print(f"{m.name[:40]:40} ERRORE: {ex}")
+            errors += 1
+            continue
+        remote = _nexus_version_of(info)
+        local = entry.get("installed_version") or m.version
+        if info.get("status") not in (None, "published"):
+            flag = f"mod {info.get('status')} su Nexus"
+        elif remote and remote != local:
+            flag = f"AGGIORNAMENTO -> {remote}"
+        else:
+            flag = "aggiornata"
+        print(f"{m.name[:40]:40} {local:>12}  {flag}")
+        entry["last_check"] = int(time.time())
+        entry["remote_version"] = remote
+    save_config(cfg)
+    return 1 if errors else 0
+
+
+def nexus_user_info(api_key, cache=True):
+    """Dati dell'account, con cache: serve a sapere se e' premium.
+
+    Gli account non premium non possono ottenere link di download dall'API senza
+    i parametri key/expires, che arrivano solo da un link nxm:// generato dal
+    sito. Il flusso di aggiornamento cambia di conseguenza.
+    """
+    import urllib.error
+    import urllib.request
+    cfg = load_config()
+    if cache and cfg.get("account", {}).get("checked_at", 0) > time.time() - 86400:
+        return cfg["account"]
+    if not api_key:
+        raise NexusError("API key non configurata")
+    req = urllib.request.Request(
+        "https://api.nexusmods.com/v1/users/validate.json",
+        headers={"apikey": api_key, "User-Agent": USER_AGENT,
+                 "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            d = json.loads(r.read().decode())
+    except urllib.error.HTTPError as ex:
+        if ex.code == 401:
+            raise NexusError("API key rifiutata (401)")
+        raise NexusError(f"errore HTTP {ex.code} da Nexus")
+    except urllib.error.URLError as ex:
+        raise NexusError(f"rete non raggiungibile: {ex.reason}")
+    acct = {"name": d.get("name", ""),
+            "is_premium": bool(d.get("is_premium")),
+            "checked_at": int(time.time())}
+    cfg["account"] = acct
+    save_config(cfg)
+    return acct
+
+
+def is_premium(api_key):
+    try:
+        return nexus_user_info(api_key).get("is_premium", False)
+    except NexusError:
+        return False
+
+
+def mod_file_page_url(mod_id, file_id=None):
+    """Pagina dei file della mod. Con nmm=1 il sito offre il download via manager,
+    che sugli account free e' l'unico modo per ottenere un link valido."""
+    u = f"https://www.nexusmods.com/baldursgate3/mods/{mod_id}?tab=files&nmm=1"
+    if file_id:
+        u += f"&file_id={file_id}"
+    return u
+
+
+def nexus_files(mod_id, api_key):
+    return nexus_get(f"/mods/{mod_id}/files.json", api_key).get("files", [])
+
+
+def pick_main_file(files):
+    """Sceglie il file da scaricare: il primario, altrimenti il MAIN piu' recente."""
+    usable = [f for f in files
+              if str(f.get("category_name") or "").upper() not in ("OLD_VERSION", "ARCHIVED")]
+    if not usable:
+        return None
+    primary = [f for f in usable if f.get("is_primary")]
+    if primary:
+        return primary[0]
+    main = [f for f in usable if str(f.get("category_name") or "").upper() == "MAIN"]
+    pool = main or usable
+    return max(pool, key=lambda f: f.get("uploaded_timestamp") or 0)
+
+
+def download_url(url, dest, progress=None):
+    """Scarica su file temporaneo e rinomina solo a download completo."""
+    import urllib.parse
+    import urllib.request
+    # i link del CDN Nexus contengono spazi non codificati nel nome file
+    p = urllib.parse.urlsplit(url)
+    url = urllib.parse.urlunsplit(
+        (p.scheme, p.netloc, urllib.parse.quote(p.path, safe="/%"), p.query, p.fragment))
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    tmp = dest + ".part"
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            total = int(r.headers.get("Content-Length") or 0)
+            got = 0
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = r.read(1 << 18)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if progress:
+                        progress(got, total)
+        os.replace(tmp, dest)
+        return dest
+    except Exception:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+
+
+def extract_paks(archive, outdir):
+    """Estrae i .pak da un archivio. Ritorna la lista dei file estratti."""
+    import subprocess
+    import zipfile
+    os.makedirs(outdir, exist_ok=True)
+    low = archive.lower()
+    if low.endswith(".pak"):
+        dest = os.path.join(outdir, os.path.basename(archive))
+        shutil.copy2(archive, dest)
+        return [dest]
+    if low.endswith(".zip"):
+        out = []
+        with zipfile.ZipFile(archive) as z:
+            for n in z.namelist():
+                if n.lower().endswith(".pak"):
+                    target = os.path.join(outdir, os.path.basename(n))
+                    with z.open(n) as src, open(target, "wb") as dst:
+                        shutil.copyfileobj(src, dst)
+                    out.append(target)
+        return out
+    # rar / 7z / altro: delega a 7z, che li gestisce quasi tutti
+    tool = shutil.which("7z") or shutil.which("7za")
+    if low.endswith(".rar") and shutil.which("unrar"):
+        tool = None
+        cmd = ["unrar", "x", "-y", "-idq", archive, outdir + os.sep]
+    elif tool:
+        cmd = [tool, "x", "-y", f"-o{outdir}", archive]
+    else:
+        raise RuntimeError(f"nessun estrattore disponibile per {os.path.basename(archive)}")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"estrazione fallita: {(r.stderr or r.stdout)[:200]}")
+    out = []
+    for root, _dirs, files in os.walk(outdir):
+        for fn in files:
+            if fn.lower().endswith(".pak"):
+                out.append(os.path.join(root, fn))
+    return out
+
+
+def update_mod(mod, entry, api_key, log=print):
+    """Scarica e installa la versione nuova di una mod. Ritorna (ok, messaggio).
+
+    Sostituisce il .pak solo se quello scaricato ha lo stesso UUID: cosi' il posto
+    nel load order e le altre voci di modsettings.lsx restano valide. Il vecchio
+    file viene tenuto da parte finche' il nuovo non e' a posto.
+    """
+    mod_id = entry.get("nexus_id")
+    if not mod_id:
+        return False, "non associata a Nexus"
+    try:
+        files = nexus_files(mod_id, api_key)
+    except NexusError as ex:
+        return False, str(ex)
+    f = pick_main_file(files)
+    if not f:
+        return False, "nessun file scaricabile (solo versioni vecchie o archiviate)"
+    remote_ver = (f.get("version") or "").strip()
+    if entry.get("installed_file_id") == f["file_id"]:
+        return False, f"gia' aggiornata ({remote_ver})"
+
+    # Account non premium: l'API non rilascia link diretti. L'unica via legittima
+    # e' il pulsante "Mod Manager Download" sul sito, che genera un nxm:// con
+    # key+expires; lo raccoglie il nostro handler. Segnaliamo la pagina da aprire.
+    if not is_premium(api_key):
+        return False, ("richiede download dal browser (account non premium): "
+                       + mod_file_page_url(mod_id, f["file_id"]))
+
+    try:
+        links = nexus_get(f"/mods/{mod_id}/files/{f['file_id']}/download_link.json", api_key)
+    except NexusError as ex:
+        if "403" in str(ex) or "premium" in str(ex).lower():
+            return False, ("download diretto negato: "
+                           + mod_file_page_url(mod_id, f["file_id"]))
+        return False, f"link non ottenibile: {ex}"
+    if not links:
+        return False, ("nessun link di download: "
+                       + mod_file_page_url(mod_id, f["file_id"]))
+
+    cache = os.path.join(CONFIG_DIR, "cache")
+    os.makedirs(cache, exist_ok=True)
+    archive = os.path.join(cache, f["file_name"])
+    log(f"  scarico {f['file_name']} ({f.get('size_kb', 0)/1024:.1f} MB)")
+    try:
+        download_url(links[0]["URI"], archive)
+    except Exception as ex:
+        return False, f"download fallito: {ex}"
+
+    tmpdir = os.path.join(cache, f"extract-{mod_id}")
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    try:
+        paks = extract_paks(archive, tmpdir)
+    except Exception as ex:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return False, str(ex)
+    if not paks:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return False, "l'archivio non contiene .pak (installazione manuale)"
+
+    # cerca il .pak con lo stesso UUID della mod installata
+    chosen = None
+    for p in paks:
+        try:
+            nm = mod_from_pak(p)
+        except Exception:
+            continue
+        if nm and nm.uuid == mod.uuid:
+            chosen = (p, nm)
+            break
+    if chosen is None:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        names = ", ".join(os.path.basename(p) for p in paks[:3])
+        return False, f"nessun .pak con lo stesso UUID (trovati: {names}) - installa a mano"
+
+    src, newmod = chosen
+    old = mod.pak
+    backup = old + ".old"
+    try:
+        if os.path.exists(old):
+            os.replace(old, backup)
+        shutil.copy2(src, os.path.join(MODS_DIR, os.path.basename(old)))
+    except OSError as ex:
+        if os.path.exists(backup) and not os.path.exists(old):
+            os.replace(backup, old)          # rimette il vecchio
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        return False, f"sostituzione fallita: {ex}"
+
+    # il vecchio .pak non si butta: si mette da parte per poter tornare indietro
+    if os.path.exists(backup):
+        olddir = os.path.join(CONFIG_DIR, "old-paks")
+        os.makedirs(olddir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        kept = os.path.join(olddir, f"{os.path.basename(old)}.{stamp}")
+        try:
+            shutil.move(backup, kept)
+            entry["previous_pak"] = kept
+        except OSError:
+            os.remove(backup)
+        # i .pak arrivano a centinaia di MB: si tengono solo le ultime 3 versioni
+        # sostituite di questa mod, le piu' vecchie si buttano
+        prefix = os.path.basename(old) + "."
+        older = sorted(f for f in os.listdir(olddir) if f.startswith(prefix))
+        for f in older[:-3]:
+            try:
+                os.remove(os.path.join(olddir, f))
+            except OSError:
+                pass
+    shutil.rmtree(tmpdir, ignore_errors=True)
+    entry["installed_version"] = remote_ver or newmod.version
+    entry["installed_file_id"] = f["file_id"]
+    entry["remote_version"] = remote_ver
+    return True, f"aggiornata a {remote_ver or newmod.version}"
+
+
+def cmd_update(target=None):
+    cfg = load_config()
+    if not cfg["nexus_api_key"]:
+        print("API key non configurata: pakrat apikey LA_TUA_CHIAVE", file=sys.stderr)
+        return 1
+    state, _ = build_state()
+    pool = [m for m in state
+            if m.has_pak and cfg["mods"].get(m.uuid, {}).get("nexus_id")]
+    if target:
+        if target.isdigit() and 1 <= int(target) <= len(state):
+            pool = [state[int(target) - 1]]
+        else:
+            pool = [m for m in pool if target.lower() in m.name.lower()]
+    if not pool:
+        print("nessuna mod associata a Nexus da aggiornare "
+              "(usa 'pakrat match' per associarle)")
+        return 1
+    ok = fail = 0
+    for m in pool:
+        print(f"{m.name}")
+        good, res = update_mod(m, cfg["mods"][m.uuid], cfg["nexus_api_key"])
+        print(f"  {res}")
+        ok += good
+        fail += not good
+        save_config(cfg)
+    print(f"\naggiornate {ok}, non aggiornate {fail}")
+    return 0
+
+
+MW5_MODULE = "mw5.py"
+
+
+def mw5_domain():
+    """Domain Nexus di MechWarrior 5, senza dover caricare il backend."""
+    return "mechwarrior5mercenaries"
+
+
+def load_mw5():
+    """Carica mw5.py accanto a questo script, o None se non c'e'.
+
+    pakrat non ha estensione .py, quindi il backend non puo' importarlo con un
+    import normale: ci registriamo in sys.modules come 'pakrat_core' e il modulo
+    ci ritrova da la', senza rieseguire questo file.
+    """
+    import importlib.machinery
+    import importlib.util
+    cached = sys.modules.get("pakrat_mw5")
+    if cached is not None:
+        return cached
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), MW5_MODULE)
+    if not os.path.isfile(path):
+        return None
+    sys.modules.setdefault("pakrat_core", sys.modules[__name__])
+    loader = importlib.machinery.SourceFileLoader("pakrat_mw5", path)
+    spec = importlib.util.spec_from_loader("pakrat_mw5", loader)
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["pakrat_mw5"] = m
+    loader.exec_module(m)
+    return m
+
+
+def cmd_nxm(url):
+    """Handler dei link nxm:// (pulsante 'Mod Manager Download')."""
+    import urllib.parse
+    p = urllib.parse.urlparse(url)
+    if p.scheme != "nxm":
+        print(f"non e' un link nxm://: {url}", file=sys.stderr)
+        return 1
+    game = p.netloc
+    if game.lower() == mw5_domain():
+        mw5 = load_mw5()
+        if mw5 is None:
+            print("backend MW5 non installato (manca mw5.py accanto a pakrat)",
+                  file=sys.stderr)
+            return 1
+        return mw5.cmd_nxm(url)
+    if game.lower() != NEXUS_GAME:
+        print(f"gioco non gestito da questo tool: {game}", file=sys.stderr)
+        return 1
+    parts = [x for x in p.path.split("/") if x]
+    try:
+        mod_id = int(parts[parts.index("mods") + 1])
+        file_id = int(parts[parts.index("files") + 1])
+    except (ValueError, IndexError):
+        print(f"link nxm malformato: {url}", file=sys.stderr)
+        return 1
+    q = urllib.parse.parse_qs(p.query)
+    key = q.get("key", [None])[0]
+    expires = q.get("expires", [None])[0]
+
+    cfg = load_config()
+    api_key = cfg["nexus_api_key"]
+    if not api_key:
+        print("API key non configurata: pakrat apikey LA_TUA_CHIAVE", file=sys.stderr)
+        return 1
+    if expires and expires.isdigit() and int(expires) < time.time():
+        print("link scaduto: rigenera il download da Nexus", file=sys.stderr)
+        return 1
+
+    path = f"/mods/{mod_id}/files/{file_id}/download_link.json"
+    if key:
+        path += f"?key={urllib.parse.quote(key)}&expires={expires}"
+    try:
+        links = nexus_get(path, api_key)
+    except NexusError as ex:
+        print(f"impossibile ottenere il link di download: {ex}", file=sys.stderr)
+        return 1
+    if not links:
+        print("Nexus non ha restituito alcun link (account non premium senza chiave nel link?)", file=sys.stderr)
+        return 1
+
+    dl = links[0].get("URI")
+    fname = urllib.parse.unquote(os.path.basename(urllib.parse.urlparse(dl).path))
+    dest_dir = os.path.expanduser("~/Downloads")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, fname)
+
+    import urllib.request
+    print(f"scarico {fname} ...")
+    try:
+        req = urllib.request.Request(dl, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=60) as r, open(dest + ".part", "wb") as f:
+            shutil.copyfileobj(r, f)
+        os.replace(dest + ".part", dest)
+    except Exception as ex:
+        if os.path.exists(dest + ".part"):
+            os.remove(dest + ".part")
+        print(f"download fallito: {ex}", file=sys.stderr)
+        return 1
+
+    # registra la mappatura, cosi' i check successivi funzionano
+    try:
+        info = nexus_get(f"/mods/{mod_id}.json", api_key)
+        version = _nexus_version_of(info)
+    except NexusError:
+        version = ""
+
+    if dest.lower().endswith(".pak"):
+        ok, res = install_pak(dest)
+        print(res)
+        if ok:
+            m = mod_from_pak(dest)
+            if m:
+                cfg["mods"].setdefault(m.uuid, {}).update(
+                    {"nexus_id": mod_id, "name": m.name, "installed_version": version or m.version})
+                save_config(cfg)
+                print(f"associata a nexusmods.com/baldursgate3/mods/{mod_id}")
+        print("apri 'pakrat' per attivarla nel load order")
+    else:
+        print(f"scaricato in {dest}")
+        print("e' un archivio (zip/rar): estrai il .pak e usa 'pakrat add FILE.pak'")
+    return 0
+
+
+DESKTOP_ENTRY = """[Desktop Entry]
+Type=Application
+Name=pakrat (nxm handler)
+Exec={exe} nxm %u
+NoDisplay=true
+MimeType=x-scheme-handler/nxm;
+Terminal=true
+"""
+
+
+def cmd_handler():
+    exe = os.path.abspath(sys.argv[0])
+    apps = os.path.expanduser("~/.local/share/applications")
+    os.makedirs(apps, exist_ok=True)
+    path = os.path.join(apps, "pakrat-nxm.desktop")
+    with open(path, "w") as f:
+        f.write(DESKTOP_ENTRY.format(exe=exe))
+    # via la voce del vecchio nome, altrimenti resta a competere per nxm://
+    old = os.path.join(apps, "bg3mods-nxm.desktop")
+    if os.path.isfile(old):
+        os.remove(old)
+        print(f"rimosso l'handler del vecchio nome ({old})")
+    os.system(f"update-desktop-database {apps} 2>/dev/null")
+    os.system("xdg-mime default pakrat-nxm.desktop x-scheme-handler/nxm 2>/dev/null")
+    print(f"handler nxm:// registrato ({path})")
+    print("verifica: xdg-mime query default x-scheme-handler/nxm")
+    return 0
+
+
+# --------------------------------------------------------------------- TUI ---
+HELP = "j/k muovi  J/K riordina  spazio on/off  a aggiungi  d elimina  w salva  r ricarica  q esci"
+
+
+def tui(stdscr):
+    curses.curs_set(0)
+    curses.use_default_colors()
+    for i in range(1, 8):
+        curses.init_pair(i, i, -1)
+    C_GREEN, C_RED, C_YELLOW, C_BLUE, C_CYAN = 2, 1, 3, 4, 6
+
+    state, errors = build_state()
+    sel = 0
+    top = 0
+    msg = f"{len([m for m in state if m.enabled])} attive, {len(state)} totali"
+    if errors:
+        msg += f" - {len(errors)} avvisi (premi e)"
+    dirty = False
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        title = " pakrat "
+        stdscr.addnstr(0, 0, title.ljust(w), w, curses.A_REVERSE)
+        mark = "*" if dirty else " "
+        stdscr.addnstr(0, max(0, w - 12), f"{mark}modifiche ", 11, curses.A_REVERSE)
+
+        rows = h - 4
+        if sel < top:
+            top = sel
+        if sel >= top + rows:
+            top = sel - rows + 1
+
+        for i in range(top, min(len(state), top + rows)):
+            m = state[i]
+            y = 1 + i - top
+            attr = curses.A_REVERSE if i == sel else 0
+            if m.is_base:
+                box, col = "[base]", curses.color_pair(C_BLUE)
+            elif not m.has_pak and m.enabled:
+                box, col = "[!pak]", curses.color_pair(C_RED)
+            elif m.enabled:
+                box, col = "[  on]", curses.color_pair(C_GREEN)
+            else:
+                box, col = "[ off]", curses.color_pair(C_YELLOW)
+            num = f"{i+1:2}" if m.enabled else " -"
+            line = f" {num} {box} {m.name[:44]:44} {m.version:>12}"
+            if m.author:
+                line += f"  {m.author[:14]}"
+            stdscr.addnstr(y, 0, line.ljust(w)[:w], w, attr | col)
+
+        stdscr.addnstr(h - 2, 0, msg[:w - 1].ljust(w - 1), w - 1, curses.color_pair(C_CYAN))
+        stdscr.addnstr(h - 1, 0, HELP[:w - 1].ljust(w - 1), w - 1, curses.A_DIM)
+        stdscr.refresh()
+
+        try:
+            c = stdscr.getch()
+        except KeyboardInterrupt:
+            break
+        if c in (ord("q"), 27):
+            if dirty:
+                msg = "ci sono modifiche non salvate: w per salvare, Q per uscire comunque"
+                dirty = "asked"
+                continue
+            break
+        if c == ord("Q"):
+            break
+        if c in (ord("j"), curses.KEY_DOWN):
+            sel = min(len(state) - 1, sel + 1)
+        elif c in (ord("k"), curses.KEY_UP):
+            sel = max(0, sel - 1)
+        elif c == ord("g"):
+            sel = 0
+        elif c == ord("G"):
+            sel = len(state) - 1
+        elif c in (ord("J"), ord("K")):
+            j = sel + (1 if c == ord("J") else -1)
+            if 0 <= j < len(state):
+                if state[sel].is_base or state[j].is_base:
+                    msg = "i moduli base restano in testa, non si spostano"
+                else:
+                    state[sel], state[j] = state[j], state[sel]
+                    sel = j
+                    dirty = True
+        elif c == ord(" "):
+            m = state[sel]
+            if m.is_base:
+                msg = "i moduli base non si disattivano"
+            elif not m.has_pak:
+                msg = "nessun .pak per questa voce: solo rimozione possibile"
+            else:
+                m.enabled = not m.enabled
+                dirty = True
+                msg = f"{m.name}: {'attiva' if m.enabled else 'disattivata'}"
+        elif c == ord("w"):
+            ok, res = write_modsettings(state)
+            msg = ("salvato: " if ok else "ERRORE: ") + res
+            if ok:
+                dirty = False
+        elif c == ord("r"):
+            state, errors = build_state()
+            sel = min(sel, len(state) - 1)
+            dirty = False
+            msg = "ricaricato"
+        elif c == ord("e"):
+            msg = " | ".join(errors)[:w - 2] if errors else "nessun avviso"
+        elif c == ord("a"):
+            curses.echo()
+            stdscr.addnstr(h - 1, 0, "percorso .pak: ".ljust(w - 1), w - 1)
+            stdscr.refresh()
+            path = stdscr.getstr(h - 1, 15, 200).decode().strip()
+            curses.noecho()
+            if path:
+                ok, res = install_pak(os.path.expanduser(path))
+                msg = res
+                if ok:
+                    state, errors = build_state()
+        elif c == ord("d"):
+            m = state[sel]
+            if m.is_base:
+                msg = "non si elimina un modulo base"
+            elif not m.has_pak:
+                state.pop(sel)
+                sel = max(0, sel - 1)
+                dirty = True
+                msg = "voce orfana rimossa dal load order"
+            else:
+                stdscr.addnstr(h - 1, 0, f"eliminare {m.name}? il .pak viene cancellato (s/n) ".ljust(w - 1), w - 1)
+                stdscr.refresh()
+                if stdscr.getch() in (ord("s"), ord("y")):
+                    try:
+                        os.remove(m.pak)
+                        state.pop(sel)
+                        sel = max(0, sel - 1)
+                        dirty = True
+                        msg = f"eliminato {m.name}"
+                    except OSError as ex:
+                        msg = f"errore: {ex}"
+                else:
+                    msg = "annullato"
+
+
+# --------------------------------------------------------------------- CLI ---
+def cmd_list():
+    state, errors = build_state()
+    print(f"{'#':>3}  {'STATO':6} {'MOD':44} {'VERSIONE':>12}  AUTORE")
+    for i, m in enumerate(state, 1):
+        if m.is_base:
+            st = "base"
+        elif not m.has_pak and m.enabled:
+            st = "!pak"
+        else:
+            st = "on" if m.enabled else "off"
+        num = f"{i:3}" if m.enabled else "  -"
+        print(f"{num}  {st:6} {m.name[:44]:44} {m.version:>12}  {m.author[:20]}")
+    if errors:
+        print("\navvisi:")
+        for e in errors:
+            print("  " + e)
+
+
+def cmd_setup():
+    """Wizard: sceglie la cartella dati di BG3 fra quelle trovate o a mano."""
+    print("Configurazione di pakrat\n")
+    current = load_config().get("larian_dir")
+    if current:
+        print(f"cartella attuale: {current}\n")
+    found = detect_larian_dirs()
+    if found:
+        print("Installazioni trovate:")
+        for i, p in enumerate(found, 1):
+            n = len([f for f in os.listdir(os.path.join(p, "Mods"))
+                     if f.lower().endswith(".pak")]) if os.path.isdir(os.path.join(p, "Mods")) else 0
+            print(f"  {i}) {p}\n     ({n} .pak installati)")
+    else:
+        print("Nessuna installazione rilevata automaticamente.")
+    print("\n  a) indica un percorso a mano")
+    print("  q) esci senza cambiare nulla\n")
+
+    while True:
+        ans = input("scelta: ").strip().lower()
+        if ans in ("q", ""):
+            return 0
+        if ans == "a":
+            print("\nServe la cartella dati di Larian, quella che contiene Mods/ e")
+            print("PlayerProfiles/. Di solito sta dentro un prefix Wine, sotto")
+            print("drive_c/users/steamuser/AppData/Local/Larian Studios/Baldur's Gate 3\n")
+            p = input("percorso: ").strip()
+            ok, msg = set_larian_dir(p)
+            if ok:
+                print(f"\nsalvato: {msg}")
+                return 0
+            print(f"non va bene: {msg}\n")
+            continue
+        if ans.isdigit() and 1 <= int(ans) <= len(found):
+            ok, msg = set_larian_dir(found[int(ans) - 1])
+            if ok:
+                print(f"\nsalvato: {msg}")
+                return 0
+            print(f"non va bene: {msg}\n")
+            continue
+        print("scelta non valida")
+
+
+def cmd_backups():
+    if not os.path.isdir(BACKUP_DIR):
+        print("nessun backup")
+        return
+    files = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith("modsettings-"))
+    if not files:
+        print("nessun backup")
+        return
+    for i, f in enumerate(files, 1):
+        p = os.path.join(BACKUP_DIR, f)
+        print(f"{i:3}  {f}  {os.path.getsize(p):>7} byte")
+
+
+def cmd_restore(n):
+    files = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith("modsettings-"))
+    try:
+        src = os.path.join(BACKUP_DIR, files[int(n) - 1])
+    except (ValueError, IndexError):
+        print(f"backup {n} inesistente")
+        return 1
+    backup_modsettings()
+    shutil.copy2(src, MODSETTINGS)
+    print(f"ripristinato {os.path.basename(src)}")
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] == "setup":
+        return cmd_setup()
+
+    # I comandi di altri giochi non devono pretendere un'installazione di BG3.
+    if args and args[0] == "mw5":
+        mw5 = load_mw5()
+        if mw5 is None:
+            print(f"backend MW5 non installato (manca {MW5_MODULE} accanto a pakrat)",
+                  file=sys.stderr)
+            return 1
+        return mw5.main(args[1:])
+    if args and args[0] == "nxm" and len(args) > 1:
+        import urllib.parse
+        if urllib.parse.urlparse(args[1]).netloc.lower() == mw5_domain():
+            return cmd_nxm(args[1])
+
+    if not LARIAN or not os.path.isdir(LARIAN):
+        print("Installazione di Baldur's Gate 3 non trovata.\n\n"
+              "Ho cercato nei prefix di Steam, Heroic, Lutris, Bottles e in ~/.wine.\n"
+              "Se BG3 e' altrove, indica la cartella dati di Larian in uno dei due modi:\n\n"
+              "  - variabile d'ambiente PAKRAT_LARIAN\n"
+              f"  - chiave \"larian_dir\" in {os.path.join(CONFIG_DIR, 'config.json')}\n\n"
+              "Deve puntare alla cartella che contiene Mods/ e PlayerProfiles/,\n"
+              "tipicamente .../AppData/Local/Larian Studios/Baldur's Gate 3\n\n"
+              "Oppure lancia:  pakrat setup",
+              file=sys.stderr)
+        return 1
+    if not args:
+        curses.wrapper(tui)
+        return 0
+    cmd = args[0]
+    if cmd == "list":
+        cmd_list()
+    elif cmd == "add":
+        if len(args) < 2:
+            print("uso: pakrat add FILE.pak", file=sys.stderr)
+            return 1
+        ok, res = install_pak(os.path.expanduser(args[1]))
+        print(res)
+        return 0 if ok else 1
+    elif cmd == "setup":
+        return cmd_setup()
+    elif cmd == "backups":
+        cmd_backups()
+    elif cmd == "apikey":
+        if len(args) < 2:
+            print("uso: pakrat apikey LA_TUA_CHIAVE", file=sys.stderr)
+            return 1
+        return cmd_apikey(args[1])
+    elif cmd == "link":
+        if len(args) < 3:
+            print("uso: pakrat link N URL_O_ID_NEXUS", file=sys.stderr)
+            return 1
+        return cmd_link(args[1], args[2])
+    elif cmd == "check":
+        return cmd_check()
+    elif cmd == "discover":
+        return cmd_discover(only_missing="--all" not in args)
+    elif cmd == "match":
+        return cmd_match(args[1] if len(args) > 1 else None)
+    elif cmd == "update":
+        return cmd_update(args[1] if len(args) > 1 else None)
+    elif cmd == "nxm":
+        if len(args) < 2:
+            print("uso: pakrat nxm nxm://...", file=sys.stderr)
+            return 1
+        return cmd_nxm(args[1])
+    elif cmd == "handler":
+        return cmd_handler()
+    elif cmd == "restore":
+        if len(args) < 2:
+            print("uso: pakrat restore N", file=sys.stderr)
+            return 1
+        return cmd_restore(args[1])
+    else:
+        print(__doc__)
+        return 1
+    return 0
+
+
+def _run():
+    """Entry point con SIGPIPE gestito: 'pakrat list | head' non deve dare traceback."""
+    try:
+        rc = main()
+    except KeyboardInterrupt:
+        return 130
+    except BrokenPipeError:
+        rc = 0
+    try:
+        sys.stdout.flush()
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        rc = 0
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(_run())
