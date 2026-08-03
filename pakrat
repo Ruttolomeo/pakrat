@@ -1229,7 +1229,9 @@ def load_mw5():
     path = os.path.join(os.path.dirname(os.path.realpath(__file__)), MW5_MODULE)
     if not os.path.isfile(path):
         return None
-    sys.modules.setdefault("pakrat_core", sys.modules[__name__])
+    me = sys.modules.get(__name__)     # "__main__" da CLI, "pakrat_core" dalla GUI
+    if me is not None:
+        sys.modules.setdefault("pakrat_core", me)
     loader = importlib.machinery.SourceFileLoader("pakrat_mw5", path)
     spec = importlib.util.spec_from_loader("pakrat_mw5", loader)
     m = importlib.util.module_from_spec(spec)

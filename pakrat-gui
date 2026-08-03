@@ -34,6 +34,9 @@ def load_core():
     loader = importlib.machinery.SourceFileLoader("pakrat_core", CORE_PATH)
     spec = importlib.util.spec_from_loader("pakrat_core", loader)
     mod = importlib.util.module_from_spec(spec)
+    # registrato prima di eseguirlo: i backend (mw5.py) cercano il core in
+    # sys.modules["pakrat_core"], e senza questo se ne caricherebbero una copia
+    sys.modules["pakrat_core"] = mod
     loader.exec_module(mod)
     return mod
 
