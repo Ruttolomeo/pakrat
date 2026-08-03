@@ -75,6 +75,8 @@ pakrat mw5 disable MOD      disattiva
 pakrat mw5 order MOD N      imposta il load order (piu' alto = caricata dopo)
 pakrat mw5 order --seq A B  riassegna l'ordine nella sequenza data
 pakrat mw5 order --apply    ri-applica l'ordine salvato nel config
+pakrat mw5 remove MOD       sposta in archivio (--purge per cancellare davvero)
+pakrat mw5 restore [N]      elenca l'archivio, o ripristina una mod rimossa
 pakrat mw5 link MOD ID      associa una mod alla sua pagina Nexus
 pakrat mw5 check            cerca aggiornamenti
 pakrat mw5 update [MOD]     scarica e installa gli aggiornamenti
@@ -101,7 +103,18 @@ In quel caso `add` le installa tutte ma chiede quali attivare, mostrando le righ
 
 `check` confronta il `file_id` di Nexus, non la stringa di versione: autori e file
 sono numerati in modo indipendente, e un confronto testuale segnalava come
-aggiornamento anche i downgrade.
+aggiornamento anche i downgrade. Il confronto avviene dentro la stessa variante:
+certe mod pubblicano piu' file principali che sono alternative fra loro (es. i
+pacchetti di ritratti, con e senza sfondi), non versioni successive, e un update
+non deve sostituirne una con l'altra.
+
+`remove` non cancella: sposta la mod in `pakrat-mods-rimosse/` accanto
+all'installazione, sullo stesso filesystem — quindi e' un rename istantaneo anche
+per una mod da un gigabyte, e si ripristina con `restore`. Il load order resta nel
+config, cosi' un ripristino non riparte dal `defaultLoadOrder` dell'autore. Serve
+perche' togliere contenuto a cui una carriera fa riferimento puo' romperne il
+salvataggio, e conviene poter tornare indietro. `--purge` cancella davvero, e
+chiede conferma esplicita mostrando quanti GB stai per perdere.
 
 ## Sicurezza dei dati
 

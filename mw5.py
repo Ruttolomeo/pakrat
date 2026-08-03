@@ -431,6 +431,136 @@ def reorder(folders, install=None):
     return applied
 
 
+# ------------------------------------------------------- rimozione mod ---
+ARCHIVE_DIRNAME = "pakrat-mods-rimosse"
+
+
+def archive_dir(install=None, create=False):
+    """Cartella d'archivio delle mod rimosse, accanto all'installazione.
+
+    Sta sullo stesso filesystem del gioco, cosi' rimuovere e' un rename e non una
+    copia da gigabyte, ed e' fuori da Mods/ quindi il gioco non la guarda.
+    """
+    install = install or resolve_install_dir()
+    if not install:
+        return ""
+    outside = os.path.join(os.path.dirname(install), ARCHIVE_DIRNAME)
+    inside = os.path.join(install, ARCHIVE_DIRNAME)
+    for cand in (outside, inside):
+        if os.path.isdir(cand):
+            return cand
+    if not create:
+        return outside
+    for cand in (outside, inside):
+        try:
+            os.makedirs(cand, exist_ok=True)
+            return cand
+        except OSError:
+            continue
+    raise RuntimeError("nessuna cartella d'archivio scrivibile")
+
+
+def forget_modlist(folders, install=None):
+    """Toglie da modStatus solo le voci indicate, lasciando intatto il resto."""
+    data = read_modlist(install)
+    st = data.get("modStatus")
+    if not isinstance(st, dict):
+        return []
+    gone = [f for f in folders if f in st]
+    if gone:
+        for f in gone:
+            del st[f]
+        write_modlist(data, install)
+    return gone
+
+
+def remove_mod(folder, install=None, purge=False, log=print):
+    """Rimuove una mod: la sposta in archivio (o la cancella con purge=True).
+
+    La voce nel db resta, con removed_at: conserva il load order scelto, cosi' un
+    eventuale ripristino non riparte dal defaultLoadOrder dell'autore.
+    """
+    md = mods_dir(install)
+    src = os.path.join(md, folder)
+    if not os.path.isdir(src):
+        raise RuntimeError(f"non installata: {folder}")
+    if not require_game_closed():
+        return ""
+    if purge:
+        shutil.rmtree(src)
+        dest = ""
+        log(f"  {folder}: cancellata")
+    else:
+        adir = archive_dir(install, create=True)
+        dest = os.path.join(adir, f"{folder}-{datetime.now():%Y%m%d-%H%M%S}")
+        try:
+            os.rename(src, dest)
+        except OSError:                    # filesystem diversi: copia e cancella
+            shutil.copytree(src, dest)
+            shutil.rmtree(src)
+        log(f"  {folder}: spostata in {dest}")
+    forget_modlist([folder], install)
+    cfg, ns = cfg_load()
+    e = ns.setdefault("mods", {}).get(folder)
+    if e is not None:
+        if purge:
+            del ns["mods"][folder]
+        else:
+            e["removed_at"] = int(time.time())
+            e["archived_to"] = dest
+        cfg_save(cfg)
+    return dest
+
+
+def list_archived(install=None):
+    """Mod in archivio: [(cartella_originale, percorso, timestamp)]."""
+    adir = archive_dir(install)
+    if not adir or not os.path.isdir(adir):
+        return []
+    out = []
+    for name in sorted(os.listdir(adir)):
+        p = os.path.join(adir, name)
+        if not os.path.isdir(p):
+            continue
+        m = re.match(r'^(.*)-(\d{8}-\d{6})$', name)
+        out.append((m.group(1) if m else name, p, m.group(2) if m else ""))
+    return out
+
+
+def restore_mod(path, install=None, enable=True, log=print):
+    """Rimette in Mods/ una mod archiviata."""
+    if not os.path.isdir(path):
+        raise RuntimeError(f"non trovata in archivio: {path}")
+    if not require_game_closed():
+        return ""
+    m = re.match(r'^(.*)-\d{8}-\d{6}$', os.path.basename(path))
+    folder = m.group(1) if m else os.path.basename(path)
+    md = mods_dir(install)
+    dest = os.path.join(md, folder)
+    if os.path.exists(dest):
+        raise RuntimeError(f"{folder} e' gia' presente in Mods/: "
+                           "rimuovila prima di ripristinare l'archivio")
+    os.makedirs(md, exist_ok=True)
+    try:
+        os.rename(path, dest)
+    except OSError:
+        shutil.copytree(path, dest)
+        shutil.rmtree(path)
+    log(f"  {folder}: ripristinata")
+    cfg, ns = cfg_load()
+    e = ns.setdefault("mods", {}).get(folder)
+    if e is not None:
+        e.pop("removed_at", None)
+        e.pop("archived_to", None)
+        cfg_save(cfg)
+    for f, old, new in apply_orders(install):
+        log(f"  ordine ri-applicato a {f}: {old} -> {new}")
+    if enable:
+        if set_enabled([folder], True, install):
+            log(f"  attivata: {folder}")
+    return folder
+
+
 # ------------------------------------------------------------ estrazione ---
 def _extract_archive(archive, outdir):
     """Estrae un archivio qualsiasi in outdir."""
@@ -890,6 +1020,103 @@ def cmd_order(args):
     return 0
 
 
+def cmd_remove(args):
+    if not args or all(a.startswith("--") for a in args):
+        print("uso: pakrat mw5 remove MOD [MOD...] [--purge]\n"
+              "  senza --purge la mod va in archivio e si puo' ripristinare\n"
+              "  con --purge viene cancellata dal disco", file=sys.stderr)
+        return 1
+    install = resolve_install_dir()
+    if not install:
+        return _no_install()
+    purge = "--purge" in args
+    mods = scan_mods(install)
+    targets, rc = [], 0
+    for a in (x for x in args if not x.startswith("--")):
+        m = find_mod(a, mods, install)
+        if m is None:
+            print(f"mod non trovata (o ambigua): {a}", file=sys.stderr)
+            rc = 1
+            continue
+        targets.append(m.folder)
+    if not targets:
+        return 1
+    if purge:
+        tot = 0
+        for f in targets:
+            for root, _d, fs in os.walk(os.path.join(mods_dir(install), f)):
+                tot += sum(os.path.getsize(os.path.join(root, x)) for x in fs
+                           if os.path.exists(os.path.join(root, x)))
+        print(f"cancellazione definitiva di {len(targets)} mod "
+              f"({tot / (1 << 30):.1f} GB): {', '.join(targets)}")
+        if sys.stdin.isatty():
+            try:
+                if input("confermi? [scrivi 'si']: ").strip().lower() not in ("si", "sì", "s"):
+                    print("annullato")
+                    return 1
+            except (EOFError, KeyboardInterrupt):
+                print("\nannullato")
+                return 1
+        else:
+            print("nessun terminale per confermare: annullato", file=sys.stderr)
+            return 1
+    for f in targets:
+        try:
+            remove_mod(f, install, purge=purge)
+        except Exception as ex:
+            print(f"  {f}: {ex}", file=sys.stderr)
+            rc = 1
+    if not purge:
+        print("ripristinabile con: pakrat mw5 restore")
+    return rc
+
+
+def cmd_restore(args):
+    install = resolve_install_dir()
+    if not install:
+        return _no_install()
+    arch = list_archived(install)
+    if not arch:
+        print(f"archivio vuoto ({archive_dir(install)})")
+        return 0
+    enable = "--no-enable" not in args
+    picks = [a for a in args if not a.startswith("--")]
+    if not picks:
+        print(f"mod in archivio ({archive_dir(install)}):\n")
+        for i, (folder, p, ts) in enumerate(arch, 1):
+            when = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}" if ts else "?"
+            size = sum(os.path.getsize(os.path.join(r, x))
+                       for r, _d, fs in os.walk(p) for x in fs
+                       if os.path.exists(os.path.join(r, x)))
+            print(f"  {i:>2}) {folder:<28} rimossa il {when}  {size / (1 << 30):.1f} GB")
+        print("\nripristina con: pakrat mw5 restore N|NOME")
+        return 0
+    rc = 0
+    for a in picks:
+        hit = None
+        if a.isdigit() and 1 <= int(a) <= len(arch):
+            hit = arch[int(a) - 1]
+        else:
+            cands = [x for x in arch if x[0].lower() == a.lower()] or \
+                    [x for x in arch if a.lower() in x[0].lower()]
+            if len(cands) == 1:
+                hit = cands[0]
+            elif len(cands) > 1:
+                print(f"ambiguo: {a} -> " + ", ".join(x[0] for x in cands), file=sys.stderr)
+                rc = 1
+                continue
+        if hit is None:
+            print(f"non in archivio: {a}", file=sys.stderr)
+            rc = 1
+            continue
+        try:
+            restore_mod(hit[1], install, enable=enable)
+        except Exception as ex:
+            print(f"  {hit[0]}: {ex}", file=sys.stderr)
+            rc = 1
+    return rc
+
+
 def cmd_prune(_args=None):
     install = resolve_install_dir()
     if not install:
@@ -1161,6 +1388,8 @@ HELP = """pakrat mw5 - MechWarrior 5: Mercenaries
   order MOD N           imposta il load order (piu' alto = caricata dopo)
   order --seq A B C     riassegna l'ordine nella sequenza data
   order --apply         ri-applica l'ordine salvato nel config
+  remove MOD [...]      sposta in archivio (--purge per cancellare davvero)
+  restore [N|NOME]      elenca l'archivio, o ripristina una mod rimossa
   link MOD ID           associa una mod installata alla sua pagina Nexus
   check                 cerca aggiornamenti su Nexus
   update [MOD]          scarica e installa gli aggiornamenti
@@ -1189,6 +1418,9 @@ def main(args):
         "enable": lambda: cmd_enable(rest, True),
         "disable": lambda: cmd_enable(rest, False),
         "order": lambda: cmd_order(rest),
+        "remove": lambda: cmd_remove(rest),
+        "rm": lambda: cmd_remove(rest),
+        "restore": lambda: cmd_restore(rest),
         "link": lambda: cmd_link(rest),
         "check": lambda: cmd_check(rest),
         "update": lambda: cmd_update(rest),
