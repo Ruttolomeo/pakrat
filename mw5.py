@@ -479,13 +479,16 @@ def remove_mod(folder, install=None, purge=False, log=print):
 
     La voce nel db resta, con removed_at: conserva il load order scelto, cosi' un
     eventuale ripristino non riparte dal defaultLoadOrder dell'autore.
+
+    Ritorna il percorso d'archivio, "" se cancellata, None se non si e' fatto
+    niente perche' il gioco era aperto.
     """
     md = mods_dir(install)
     src = os.path.join(md, folder)
     if not os.path.isdir(src):
         raise RuntimeError(f"non installata: {folder}")
     if not require_game_closed():
-        return ""
+        return None
     if purge:
         shutil.rmtree(src)
         dest = ""
@@ -532,7 +535,7 @@ def restore_mod(path, install=None, enable=True, log=print):
     if not os.path.isdir(path):
         raise RuntimeError(f"non trovata in archivio: {path}")
     if not require_game_closed():
-        return ""
+        return None
     m = re.match(r'^(.*)-\d{8}-\d{6}$', os.path.basename(path))
     folder = m.group(1) if m else os.path.basename(path)
     md = mods_dir(install)
@@ -1060,13 +1063,17 @@ def cmd_remove(args):
         else:
             print("nessun terminale per confermare: annullato", file=sys.stderr)
             return 1
+    done = 0
     for f in targets:
         try:
-            remove_mod(f, install, purge=purge)
+            if remove_mod(f, install, purge=purge) is None:
+                rc = 1
+                break            # gioco aperto: inutile insistere sulle altre
+            done += 1
         except Exception as ex:
             print(f"  {f}: {ex}", file=sys.stderr)
             rc = 1
-    if not purge:
+    if done and not purge:
         print("ripristinabile con: pakrat mw5 restore")
     return rc
 
@@ -1083,12 +1090,14 @@ def cmd_restore(args):
     picks = [a for a in args if not a.startswith("--")]
     if not picks:
         print(f"mod in archivio ({archive_dir(install)}):\n")
+        w = max([len(f) for f, _p, _t in arch] + [20])
         for i, (folder, p, ts) in enumerate(arch, 1):
             when = f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[9:11]}:{ts[11:13]}" if ts else "?"
             size = sum(os.path.getsize(os.path.join(r, x))
                        for r, _d, fs in os.walk(p) for x in fs
                        if os.path.exists(os.path.join(r, x)))
-            print(f"  {i:>2}) {folder:<28} rimossa il {when}  {size / (1 << 30):.1f} GB")
+            print(f"  {i:>2}) {folder:<{w}}  rimossa il {when}  "
+                  f"{size / (1 << 30):.1f} GB")
         print("\nripristina con: pakrat mw5 restore N|NOME")
         return 0
     rc = 0
