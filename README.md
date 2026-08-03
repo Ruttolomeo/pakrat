@@ -151,10 +151,13 @@ GPL-3.0-or-later. Vedi [LICENSE](LICENSE).
 
 Uso personale. BG3 testato su un'installazione Heroic/GOG con 11 mod.
 
-MechWarrior 5: formato di `modlist.json` e comportamento del load order verificati
-sul gioco; installazione, attivazione, riordino e persistenza dell'ordine
-attraverso un update collaudati su un'installazione di prova.
+MechWarrior 5, su un'installazione Heroic/Epic: formato di `modlist.json` e
+comportamento del load order verificati sul gioco. Il flusso `nxm://` completo e'
+collaudato end-to-end — clic su "Mod Manager Download", download, estrazione,
+installazione, attivazione, registrazione dell'ID Nexus — cosi' come `mw5 check`
+contro l'API reale. Riordino e persistenza dell'ordine attraverso un update
+collaudati su un'installazione di prova.
 
-Non ancora verificati: il flusso `nxm://` completo su entrambi i giochi (serve un
-link con `key`/`expires` generato dal sito), l'estrazione di archivi rar/7z e
-`mw5 check`/`update` contro l'API reale di Nexus.
+Non ancora verificati: il flusso `nxm://` per BG3 (quello di MW5 sì), `mw5 update`
+su una mod che ha effettivamente una versione nuova, e l'estrazione di archivi
+rar/7z per MW5 (per BG3 sì).
