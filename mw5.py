@@ -652,6 +652,64 @@ def remote_version(info):
     return str(info.get("version") or "").strip()
 
 
+def _vkey(v):
+    """Chiave d'ordinamento tollerante per versioni tipo '2.1a', '0.98.5', '4.0'."""
+    out = []
+    for tok in re.findall(r'\d+|[A-Za-z]+', str(v or "")):
+        out.append((0, int(tok), "") if tok.isdigit() else (1, 0, tok.lower()))
+    return out
+
+
+def usable_files(files):
+    return [f for f in files
+            if str(f.get("category_name") or "").upper() not in ("OLD_VERSION", "ARCHIVED")]
+
+
+def remote_status(files, entry):
+    """Confronta cosa c'e' su Nexus con cosa e' installato.
+
+    Ritorna (stato, file_da_scaricare, versione_remota, nota). Stati:
+      "update"   esiste una versione piu' nuova della SUA variante
+      "ok"       sei all'ultima
+      "variant"  stessa versione, file diverso: la mod pubblica piu' varianti
+                 (es. ritratti con e senza sfondi) e non va scambiata
+      "gone"     il file installato non e' piu' in elenco
+      "unknown"  non sappiamo quale file fosse installato
+
+    Il confronto e' fatto dentro la stessa variante, identificata dal nome del
+    file: altrimenti un update ti sostituirebbe la variante scelta con un'altra.
+    """
+    us = usable_files(files)
+    if not us:
+        return "gone", None, "", "nessun file scaricabile"
+    fid = entry.get("installed_file_id")
+    if not fid:
+        return "unknown", core().pick_main_file(us), "", ""
+    inst = next((f for f in files if f.get("file_id") == fid), None)
+    if inst is None:
+        f = core().pick_main_file(us)
+        return "gone", f, (f.get("version") or "").strip(), \
+            "il file installato non e' piu' su Nexus"
+    name = str(inst.get("name") or "").strip().lower()
+    same = [f for f in us if str(f.get("name") or "").strip().lower() == name] or [inst]
+    target = max(same, key=lambda f: _vkey(f.get("version")))
+    iv = (inst.get("version") or "").strip()
+    tv = (target.get("version") or "").strip()
+    if _vkey(tv) > _vkey(iv):
+        return "update", target, tv, ""
+    # varianti = altri file della STESSA categoria alla stessa versione. I
+    # "Source files" stanno in MISCELLANEOUS e non sono alternative giocabili.
+    cat = str(inst.get("category_name") or "").upper()
+    others = [f for f in us if f.get("file_id") != fid
+              and str(f.get("category_name") or "").upper() == cat
+              and _vkey(f.get("version")) == _vkey(iv)]
+    if others:
+        return "variant", None, iv, \
+            "altre varianti alla stessa versione: " + ", ".join(
+                str(f.get("name")) for f in others[:3])
+    return "ok", None, iv, ""
+
+
 def link_folder(folder, mod_id, ns, file_id=None, version=""):
     entry = ns.setdefault("mods", {}).setdefault(folder, {})
     entry["nexus_id"] = int(mod_id)
@@ -895,29 +953,22 @@ def cmd_check(_args=None):
         except c.NexusError as ex:
             print(f"{m.name}: {ex}")
             continue
-        f = c.pick_main_file(files)
-        if not f:
-            print(f"{m.name}: nessun file scaricabile su Nexus")
-            continue
-        rv = (f.get("version") or "").strip()
+        state, _f, rv, note = remote_status(files, e)
         lv = e.get("installed_version") or m.version
-        # Il confronto autorevole e' sul file_id, non sulla stringa di versione:
-        # gli autori numerano il mod.json e i file di Nexus in modo indipendente,
-        # e un confronto per disuguaglianza segnalava come "aggiornamento" anche
-        # i downgrade (es. mod.json 2.8 contro file Nexus 2.4.6).
-        fid = e.get("installed_file_id")
-        if fid:
-            if fid != f["file_id"]:
-                print(f"{m.name}: {lv or '?'} -> {rv or '?'}  AGGIORNAMENTO")
-                updates += 1
-            else:
-                print(f"{m.name}: {lv or '?'}  ok")
-        elif rv and lv and rv == lv:
-            print(f"{m.name}: {lv}  ok")
-        else:
-            print(f"{m.name}: {lv or '?'} / su Nexus {rv or '?'}  "
-                  "(file installato non registrato, non verificabile)")
+        if state == "update":
+            print(f"{m.name}: {lv or '?'} -> {rv or '?'}  AGGIORNAMENTO")
+            updates += 1
+        elif state == "gone":
+            print(f"{m.name}: {lv or '?'}  ! {note}")
             unknown += 1
+        elif state == "variant":
+            print(f"{m.name}: {lv or '?'}  ok  ({note})")
+        elif state == "unknown":
+            print(f"{m.name}: {lv or '?'}  (file installato non registrato, "
+                  "non verificabile)")
+            unknown += 1
+        else:
+            print(f"{m.name}: {lv or '?'}  ok")
     print(f"\n{updates} aggiornamenti disponibili"
           + ("  (pakrat mw5 update)" if updates else ""))
     if unknown:
@@ -936,12 +987,19 @@ def update_one(m, entry, api_key, install, log=print):
         files = nexus_get(f"/mods/{mod_id}/files.json", api_key).get("files", [])
     except c.NexusError as ex:
         return False, str(ex)
-    f = c.pick_main_file(files)
-    if not f:
+    state, f, rv, note = remote_status(files, entry)
+    if state == "ok":
+        return False, f"gia' aggiornata ({rv or '?'})"
+    if state == "variant":
+        # Piu' file MAIN alla stessa versione sono varianti, non aggiornamenti:
+        # scaricare l'altra sostituirebbe una scelta deliberata dell'utente.
+        return False, (f"gia' aggiornata ({rv or '?'}); {note} — "
+                       "per cambiare variante scaricala dal sito")
+    if f is None:
         return False, "nessun file scaricabile"
-    rv = (f.get("version") or "").strip()
-    if entry.get("installed_file_id") == f["file_id"]:
-        return False, f"gia' aggiornata ({rv})"
+    if state == "unknown":
+        log("  attenzione: file di provenienza non registrato, "
+            f"installo il principale ({f.get('name')})")
     # Senza premium l'API non rilascia link diretti: l'unica via e' il pulsante
     # "Mod Manager Download" sul sito, che genera un nxm:// per il nostro handler.
     if not c.is_premium(api_key):
