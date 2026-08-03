@@ -68,7 +68,8 @@ comune col resto del tool, il resto e' separato.
 
 ```
 pakrat mw5 list             elenco mod, stato e load order
-pakrat mw5 add ARCHIVIO     installa da zip/7z/rar (--no-enable per non attivare)
+pakrat mw5 add ARCHIVIO     installa da zip/7z/rar; se l'archivio contiene piu'
+                            mod chiede quali attivare (--no-enable / --enable-all)
 pakrat mw5 enable MOD       attiva (indice, nome cartella o nome visualizzato)
 pakrat mw5 disable MOD      disattiva
 pakrat mw5 order MOD N      imposta il load order (piu' alto = caricata dopo)
@@ -92,6 +93,15 @@ Tre particolarita' di MW5, tutte verificate sul gioco:
   ri-applica dopo ogni `update`.
 - Il gioco riscrive `modlist.json` quando esce: se e' aperto, `pakrat` si rifiuta
   di scrivere invece di perdere le modifiche in silenzio.
+
+Un archivio MW5 puo' contenere piu' cartelle-mod: tipicamente il mod principale
+piu' patch opzionali, che dipendono da altre mod e non vanno attivati alla cieca.
+In quel caso `add` le installa tutte ma chiede quali attivare, mostrando le righe
+`REQUIRES` / `DO NOT USE` pescate dalla descrizione di ogni `mod.json`.
+
+`check` confronta il `file_id` di Nexus, non la stringa di versione: autori e file
+sono numerati in modo indipendente, e un confronto testuale segnalava come
+aggiornamento anche i downgrade.
 
 ## Sicurezza dei dati
 

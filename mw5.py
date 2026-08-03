@@ -501,8 +501,77 @@ def install_tree(src, install=None, force=True):
     return folder, existed
 
 
+_REQ_RE = re.compile(r'(requires?|do ?not use|don\'t use|incompatible|prerequisit)', re.I)
+
+
+def meta_warnings(meta):
+    """Righe di 'REQUIRES' / 'DO NOT USE' dalla descrizione di un mod.json.
+
+    Sono l'informazione che decide se una mod va attivata o no, e stanno sepolte
+    nella descrizione: vale la pena tirarle su prima di chiedere.
+    """
+    desc = str(meta.get("description") or "")
+    desc = re.sub(r'\[/?[a-z0-9=#*\s"\'.,:;/-]+\]', '', desc, flags=re.I)
+    out = []
+    for line in desc.splitlines():
+        line = line.strip()
+        if line and _REQ_RE.search(line) and line not in out:
+            out.append(line)
+    return out[:3]
+
+
+def choose_to_enable(candidates, log=print):
+    """Chiede quali mod attivare quando un archivio ne contiene piu' di una.
+
+    Un archivio con piu' cartelle-mod di solito e' un mod principale piu' patch
+    opzionali, che non vanno attivati alla cieca: dipendono da altre mod che
+    magari non hai. Senza un terminale non si attiva niente e si spiega come fare.
+    """
+    log(f"  l'archivio contiene {len(candidates)} mod:")
+    for i, (folder, meta) in enumerate(candidates, 1):
+        name = str(meta.get("displayName") or folder)
+        nfiles = len(meta.get("manifest") or [])
+        log(f"    {i}) {folder}  -  {name} {meta.get('version') or '?'}"
+            f"  ({nfiles} file nel manifest)")
+        for w in meta_warnings(meta):
+            log(f"       ! {w[:140]}")
+    if not sys.stdin.isatty():
+        log("  nessun terminale per chiedere: non ne attivo nessuna.")
+        log("  attivale con: pakrat mw5 enable NOME [NOME...]")
+        return []
+    folders = [f for f, _ in candidates]
+    while True:
+        try:
+            ans = input("  quali attivo? [numeri, 'a' tutte, invio nessuna]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return []
+        if not ans:
+            return []
+        if ans.lower() in ("a", "all", "t", "tutte"):
+            return list(folders)
+        picks, bad = [], False
+        for tok in ans.replace(",", " ").split():
+            if not tok.isdigit() or not 1 <= int(tok) <= len(folders):
+                bad = True
+                break
+            f = folders[int(tok) - 1]
+            if f not in picks:
+                picks.append(f)
+        if bad or not picks:
+            print(f"  rispondi con numeri fra 1 e {len(folders)}, 'a', o invio")
+            continue
+        return picks
+
+
 def install_archive(archive, install=None, enable=True, force=True, log=print):
     """Estrae un archivio e installa tutte le mod che contiene.
+
+    'enable' decide cosa attivare dopo l'installazione:
+      True    una sola mod -> attiva; piu' di una -> chiede quali
+      "all"   attiva tutto senza chiedere
+      "keep"  conserva lo stato che ogni cartella aveva (per gli update)
+      False   non attiva niente
 
     Ritorna la lista dei nomi cartella installati.
     """
@@ -521,10 +590,12 @@ def install_archive(archive, install=None, enable=True, force=True, log=print):
             raise RuntimeError(
                 "nessun mod.json nell'archivio: non e' una mod MW5, oppure va "
                 "installata a mano (leggi la descrizione su Nexus)")
-        installed = []
+        installed, candidates = [], []
+        prev = status_map(install)          # stato prima di toccare niente
         cfg, ns = cfg_load()
         for r in roots:
             meta = read_mod_json(r) or {}
+            candidates.append((os.path.basename(r.rstrip(os.sep)), meta))
             folder, was_update = install_tree(r, install, force=force)
             entry = ns.setdefault("mods", {}).setdefault(folder, {})
             entry["display_name"] = str(meta.get("displayName") or folder)
@@ -543,9 +614,23 @@ def install_archive(archive, install=None, enable=True, force=True, log=print):
         # l'archivio porta il defaultLoadOrder dell'autore: rimettiamo il nostro
         for folder, old, new in apply_orders(install):
             log(f"  ordine ri-applicato a {folder}: {old} -> {new}")
-        if enable and installed:
-            set_enabled(installed, True, install)
-            log(f"  attivate: {', '.join(installed)}")
+        if installed:
+            if enable == "keep":
+                # update: si conserva lo stato che ogni cartella aveva
+                want = [f for f in installed if (prev.get(f) or {}).get("bEnabled")]
+            elif enable == "all":
+                want = list(installed)
+            elif enable:
+                want = (choose_to_enable([c for c in candidates if c[0] in installed],
+                                         log=log)
+                        if len(installed) > 1 else list(installed))
+            else:
+                want = []
+            if want:
+                set_enabled(want, True, install)
+                log(f"  attivate: {', '.join(want)}")
+            elif enable:
+                log("  nessuna attivata")
         return installed
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -653,12 +738,14 @@ def cmd_setup(args):
 
 def cmd_add(args):
     if not args:
-        print("uso: pakrat mw5 add ARCHIVIO.zip [--no-enable]", file=sys.stderr)
+        print("uso: pakrat mw5 add ARCHIVIO.zip [--no-enable|--enable-all]",
+              file=sys.stderr)
         return 1
     install = resolve_install_dir()
     if not install:
         return _no_install()
-    enable = "--no-enable" not in args
+    enable = False if "--no-enable" in args else (
+        "all" if "--enable-all" in args else True)
     files = [a for a in args if not a.startswith("--")]
     rc = 0
     for f in files:
@@ -800,23 +887,42 @@ def cmd_check(_args=None):
     if not mapped:
         print("nessuna mod associata a Nexus (usa: pakrat mw5 link MOD ID)")
         return 0
-    updates = 0
+    updates = unknown = 0
     for m in mapped:
         e = ns["mods"][m.folder]
         try:
-            info = nexus_get(f"/mods/{e['nexus_id']}.json", api_key)
+            files = nexus_get(f"/mods/{e['nexus_id']}/files.json", api_key).get("files", [])
         except c.NexusError as ex:
             print(f"{m.name}: {ex}")
             continue
-        rv = remote_version(info)
+        f = c.pick_main_file(files)
+        if not f:
+            print(f"{m.name}: nessun file scaricabile su Nexus")
+            continue
+        rv = (f.get("version") or "").strip()
         lv = e.get("installed_version") or m.version
-        if rv and rv != lv:
-            print(f"{m.name}: {lv or '?'} -> {rv}  AGGIORNAMENTO")
-            updates += 1
+        # Il confronto autorevole e' sul file_id, non sulla stringa di versione:
+        # gli autori numerano il mod.json e i file di Nexus in modo indipendente,
+        # e un confronto per disuguaglianza segnalava come "aggiornamento" anche
+        # i downgrade (es. mod.json 2.8 contro file Nexus 2.4.6).
+        fid = e.get("installed_file_id")
+        if fid:
+            if fid != f["file_id"]:
+                print(f"{m.name}: {lv or '?'} -> {rv or '?'}  AGGIORNAMENTO")
+                updates += 1
+            else:
+                print(f"{m.name}: {lv or '?'}  ok")
+        elif rv and lv and rv == lv:
+            print(f"{m.name}: {lv}  ok")
         else:
-            print(f"{m.name}: {lv or '?'}  ok")
+            print(f"{m.name}: {lv or '?'} / su Nexus {rv or '?'}  "
+                  "(file installato non registrato, non verificabile)")
+            unknown += 1
     print(f"\n{updates} aggiornamenti disponibili"
           + ("  (pakrat mw5 update)" if updates else ""))
+    if unknown:
+        print(f"{unknown} non verificabili: reinstallale con 'pakrat mw5 update MOD' "
+              "per registrare il file di provenienza")
     return 0
 
 
@@ -857,7 +963,7 @@ def update_one(m, entry, api_key, install, log=print):
     except Exception as ex:
         return False, f"download fallito: {ex}"
     try:
-        got = install_archive(archive, install, enable=m.enabled, log=log)
+        got = install_archive(archive, install, enable="keep", log=log)
     except Exception as ex:
         return False, str(ex)
     if not got:
@@ -989,7 +1095,9 @@ def cmd_nxm(url):
 HELP = """pakrat mw5 - MechWarrior 5: Mercenaries
 
   list                  elenco mod, stato e load order
-  add ARCHIVIO [...]    installa da zip/7z/rar (--no-enable per non attivare)
+  add ARCHIVIO [...]    installa da zip/7z/rar
+                        se l'archivio contiene piu' mod chiede quali attivare
+                        --no-enable non attiva nulla, --enable-all attiva tutto
   enable MOD [...]      attiva
   disable MOD [...]     disattiva
   order MOD N           imposta il load order (piu' alto = caricata dopo)
