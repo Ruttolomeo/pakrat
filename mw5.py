@@ -184,21 +184,44 @@ def modlist_path(install=None):
 
 
 # --------------------------------------------------- guardia gioco aperto ---
+def _proc_names(piddir):
+    """(comm, basename di argv[0]) di un processo, in minuscolo."""
+    argv0 = ""
+    try:
+        with open(os.path.join(piddir, "cmdline"), "rb") as f:
+            argv0 = f.read().split(b"\0", 1)[0].decode("utf-8", "replace")
+    except OSError:
+        pass
+    argv0 = re.split(r'[\\/]', argv0)[-1].lower()
+    comm = ""
+    try:
+        with open(os.path.join(piddir, "comm")) as f:
+            comm = f.read().strip().lower()
+    except OSError:
+        pass
+    return comm, argv0
+
+
 def game_running():
-    """True se MW5 e' in esecuzione. Scansiona /proc: pgrep -f darebbe falsi
-    positivi perche' il pattern compare nella riga di comando di pgrep stessa."""
+    """True se MW5 e' in esecuzione.
+
+    Si confronta il NOME del processo, non l'intera riga di comando: cercare la
+    stringa nel cmdline dava falsi positivi su qualunque processo che nominasse
+    l'eseguibile, shell e script compresi (e' anche il motivo per cui non si usa
+    'pgrep -f', che matcha se stesso). 'comm' e' troncato a 15 caratteri dal
+    kernel, quindi il confronto e' su h[:15].
+    """
     me = os.getpid()
-    for entry in glob.glob("/proc/[0-9]*/cmdline"):
+    for d in glob.glob("/proc/[0-9]*"):
         try:
-            pid = int(entry.split("/")[2])
-            if pid == me:
+            if int(os.path.basename(d)) == me:
                 continue
-            with open(entry, "rb") as f:
-                cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace").lower()
-        except (OSError, ValueError):
+        except ValueError:
             continue
-        if any(h in cmd for h in _EXE_HINTS):
-            return True
+        comm, argv0 = _proc_names(d)
+        for h in _EXE_HINTS:
+            if argv0 == h or (comm and comm == h[:15]):
+                return True
     return False
 
 
