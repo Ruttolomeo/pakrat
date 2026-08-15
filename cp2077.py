@@ -2050,12 +2050,74 @@ def cmd_search(args):
     return 0
 
 
+def fetch_and_install(mod_id, api_key, install, enable=True, file_id=None):
+    """Scarica una mod da Nexus e la installa. Ritorna (slug, errore).
+
+    Estratto da 'get' perche' lo usa anche l'installazione di una catena di
+    dipendenze: la parte "prendi il file principale, scarica, installa, registra
+    l'associazione a Nexus" e' la stessa, cambia solo chi decide gli ID.
+    """
+    c = core()
+    try:
+        info = nexus_get(f"/mods/{mod_id}.json", api_key)
+        files = nexus_get(f"/mods/{mod_id}/files.json", api_key).get("files", [])
+    except Exception as ex:
+        return None, str(ex)
+    name = str(info.get("name") or mod_id)
+    print(f"{name} (v{info.get('version') or '?'}) — {info.get('author') or ''}")
+    if file_id:
+        f = next((x for x in files if int(x["file_id"]) == file_id), None)
+        if f is None:
+            return None, f"file_id {file_id} non trovato fra i file di questa mod"
+    else:
+        f = c.pick_main_file(files)
+    if f is None:
+        return None, "nessun file scaricabile"
+    # senza premium l'API non da' link diretti: si passa dal browser, ed e'
+    # esattamente cio' che fa il pulsante "Mod Manager Download"
+    if not c.is_premium(api_key):
+        return None, ("serve il download dal sito (account non premium):\n  "
+                      + mod_page_url(mod_id, f["file_id"]))
+    try:
+        links = nexus_get(
+            f"/mods/{mod_id}/files/{f['file_id']}/download_link.json", api_key)
+    except Exception as ex:
+        return None, f"link non ottenibile: {ex}"
+    if not links:
+        return None, "nessun link: " + mod_page_url(mod_id, f["file_id"])
+    cache = os.path.join(c.CONFIG_DIR, "cache")
+    os.makedirs(cache, exist_ok=True)
+    archive = os.path.join(cache, f["file_name"])
+    if not os.path.isfile(archive):
+        print(f"  scarico {f['file_name']} ({f.get('size_kb', 0)/1024:.1f} MB)")
+        try:
+            c.download_url(links[0]["URI"], archive)
+        except Exception as ex:
+            return None, f"download fallito: {ex}"
+    try:
+        slug = install_archive(archive, install, enable=enable,
+                               log=lambda s: print("  " + s.lstrip()))
+    except Exception as ex:
+        return None, str(ex)
+    if not slug:
+        return None, "installazione non riuscita"
+    # arrivando da Nexus l'associazione la sappiamo gia': registrarla qui evita
+    # il 'link' a mano e fa funzionare 'check' da subito
+    cfg, ns = cfg_load()
+    link_slug(slug, mod_id, ns, file_id=f["file_id"],
+              version=str(info.get("version") or ""))
+    e = ns.setdefault("mods", {}).setdefault(slug, {})
+    e["display_name"] = name
+    cfg_save(cfg)
+    return slug, ""
+
+
 def cmd_get(args):
     """Scarica e installa una mod dal suo ID Nexus: il passo dopo 'search'."""
     refs = [a for a in args if not a.startswith("-")]
     if not refs:
-        print("uso: pakrat cp2077 get ID [ID...] [--file FILE_ID] [--no-enable]",
-              file=sys.stderr)
+        print("uso: pakrat cp2077 get ID [ID...] [--file FILE_ID] [--no-enable]\n"
+              "                          [--with-reqs]", file=sys.stderr)
         return 1
     file_id = None
     if "--file" in args:
@@ -2074,82 +2136,23 @@ def cmd_get(args):
         return 1
     if not require_game_closed():
         return 1
-    rc, done = 0, []
+    ids = []
     for ref in refs:
         mod_id = parse_ref(ref)
         if not mod_id:
             print(f"non e' un ID o un URL di mod: {ref}", file=sys.stderr)
+            return 1
+        ids.append(mod_id)
+    if "--with-reqs" in args:
+        ids = expand_reqs(ids, api_key, install)
+    rc, done = 0, []
+    for mod_id in ids:
+        slug, err = fetch_and_install(mod_id, api_key, install, enable=enable,
+                                      file_id=file_id if len(ids) == 1 else None)
+        if err:
+            print(f"  {err}", file=sys.stderr)
             rc = 1
             continue
-        try:
-            info = nexus_get(f"/mods/{mod_id}.json", api_key)
-            files = nexus_get(f"/mods/{mod_id}/files.json", api_key).get("files", [])
-        except Exception as ex:
-            print(f"{mod_id}: {ex}", file=sys.stderr)
-            rc = 1
-            continue
-        name = str(info.get("name") or mod_id)
-        print(f"{name} (v{info.get('version') or '?'}) — {info.get('author') or ''}")
-        if file_id:
-            f = next((x for x in files if int(x["file_id"]) == file_id), None)
-            if f is None:
-                print(f"  file_id {file_id} non trovato fra i file di questa mod",
-                      file=sys.stderr)
-                rc = 1
-                continue
-        else:
-            f = c.pick_main_file(files)
-        if f is None:
-            print("  nessun file scaricabile", file=sys.stderr)
-            rc = 1
-            continue
-        # senza premium l'API non da' link diretti: si passa dal browser, ed e'
-        # esattamente cio' che fa il pulsante "Mod Manager Download"
-        if not c.is_premium(api_key):
-            print("  serve il download dal sito (account non premium):")
-            print("  " + mod_page_url(mod_id, f["file_id"]))
-            rc = 1
-            continue
-        try:
-            links = nexus_get(
-                f"/mods/{mod_id}/files/{f['file_id']}/download_link.json", api_key)
-        except Exception as ex:
-            print(f"  link non ottenibile: {ex}", file=sys.stderr)
-            rc = 1
-            continue
-        if not links:
-            print("  nessun link: " + mod_page_url(mod_id, f["file_id"]),
-                  file=sys.stderr)
-            rc = 1
-            continue
-        cache = os.path.join(c.CONFIG_DIR, "cache")
-        os.makedirs(cache, exist_ok=True)
-        archive = os.path.join(cache, f["file_name"])
-        if not os.path.isfile(archive):
-            print(f"  scarico {f['file_name']} "
-                  f"({f.get('size_kb', 0)/1024:.1f} MB)")
-            try:
-                c.download_url(links[0]["URI"], archive)
-            except Exception as ex:
-                print(f"  download fallito: {ex}", file=sys.stderr)
-                rc = 1
-                continue
-        try:
-            slug = install_archive(archive, install, enable=enable,
-                                   log=lambda s: print("  " + s.lstrip()))
-        except Exception as ex:
-            print(f"  errore: {ex}", file=sys.stderr)
-            rc = 1
-            continue
-        if not slug:
-            rc = 1
-            continue
-        # arrivando da Nexus l'associazione la sappiamo gia': registrarla qui
-        # evita il 'link' a mano e fa funzionare 'check' da subito
-        cfg, ns = cfg_load()
-        link_slug(slug, mod_id, ns, file_id=f["file_id"],
-                  version=str(info.get("version") or ""))
-        cfg_save(cfg)
         done.append(slug)
     if done:
         print(f"\nfatto. Controlla con: pakrat cp2077 list")
@@ -2159,6 +2162,421 @@ def cmd_get(args):
                            (ns.get("mods") or {}).get(s, {}).get("files") or [],
                            install)})
         offer_bootstrap(need, install)
+    return rc
+
+
+# ------------------------------------------------- dipendenze fra mod Nexus ---
+# L'API Nexus NON espone i "Requirements" di una mod: stanno solo nella pagina
+# web. Ma la descrizione, quella si' che l'API la da', e nella descrizione gli
+# autori i prerequisiti li linkano — con l'URL della mod, quindi con il suo ID.
+#
+# Quindi la catena si deduce invece di cablarla a mano in una tabella che
+# invecchia. E' un'euristica, non un grafo: una descrizione linka anche le mod
+# consigliate, quelle dell'autore e i ringraziamenti. Per questo si distingue
+# "richiesto" da "citato" e non si installa niente senza mostrarlo prima.
+_REQ_RE = re.compile(r"\b(require\w*|need\w*|mandatory|prerequisit\w*|"
+                     r"obbligator\w*|must have)\b", re.I)
+_NEG_RE = re.compile(r"\b(not|no longer|never|non)\b[^.]{0,24}?\b(require\w*|need\w*)\b",
+                     re.I)
+_OPT_RE = re.compile(r"\b(optional|recommend\w*|suggest\w*|consigliat\w*)\b", re.I)
+# Un'intestazione e' una riga CORTA che parla di requisiti e non contiene link:
+# "Requirements", "REQUIREMENTS:", "1. Install requirements". Pretendere che la
+# riga sia solo quella parola non basta — quasi nessuno la scrive cosi'.
+_HEAD_RE = re.compile(r"^(?=.{0,44}$)(?!.*nexusmods\.com)"
+                      r".*\b(requirements?|required mods?|prerequisites?)\b.*$", re.I)
+_LINK_RE = re.compile(r"nexusmods\.com/" + NEXUS_GAME + r"/mods/(\d+)", re.I)
+
+
+def _plain_lines(desc):
+    """La descrizione Nexus (BBCode + HTML) ridotta a righe leggibili.
+
+    I tag si tolgono ma gli URL no: sono l'informazione che ci interessa, e in
+    BBCode stanno dentro l'attributo del tag, non nel testo.
+    """
+    import html as _html
+    t = _html.unescape(desc or "")
+    # PRIMA gli url, e con il nome del tag delimitato: '[u...]' come alternativa
+    # generica si mangiava anche '[url=...]' quando l'indirizzo era corto, e li'
+    # dentro ci sono esattamente le dipendenze che cerchiamo
+    t = re.sub(r"\[url=([^\]]+)\]", r" \1 ", t, flags=re.I)
+    t = re.sub(r"\[/?url\]", " ", t, flags=re.I)
+    t = re.sub(r"\[(/?)(?:b|i|u|size|color|center|left|right|quote|list|\*|img|"
+               r"youtube|spoiler|font|line)(?=[\]= ])[^\]]{0,60}\]", " ", t,
+               flags=re.I)
+    t = re.sub(r"<br\s*/?>", "\n", t, flags=re.I)
+    t = re.sub(r"<a[^>]{0,200}?href=\"([^\"]+)\"[^>]*>", r" \1 ", t, flags=re.I)
+    t = re.sub(r"<[^>]{0,120}>", " ", t)
+    return [" ".join(x.split()) for x in t.split("\n")]
+
+
+def page_requirements(mod_id, api_key, info=None):
+    """[(id, forza, riga)] dedotti dalla descrizione. forza: 'richiesto'|'citato'."""
+    if info is None:
+        info = nexus_get(f"/mods/{mod_id}.json", api_key)
+    found = {}
+    under_head = 0
+    for line in _plain_lines(info.get("description")):
+        if _HEAD_RE.match(line):
+            under_head = 8              # le righe subito dopo l'intestazione
+            continue
+        ids = [int(x) for x in _LINK_RE.findall(line)]
+        strong = (_REQ_RE.search(line) and not _NEG_RE.search(line)
+                  and not _OPT_RE.search(line)) or under_head > 0
+        if line:
+            under_head = max(0, under_head - 1)
+        for i in ids:
+            if i == int(mod_id):
+                continue
+            forza = "richiesto" if strong else "citato"
+            old = found.get(i)
+            if old is None or (old[0] == "citato" and forza == "richiesto"):
+                found[i] = (forza, line[:160])
+    return [(i, f, l) for i, (f, l) in found.items()]
+
+
+_NAME_CACHE = {}
+
+
+def mod_name(mod_id, api_key):
+    """Il nome di una mod dal suo ID, ricordato per non richiederlo due volte."""
+    mod_id = int(mod_id)
+    if mod_id not in _NAME_CACHE:
+        try:
+            _NAME_CACHE[mod_id] = str(
+                nexus_get(f"/mods/{mod_id}.json", api_key).get("name") or mod_id)
+        except Exception:
+            _NAME_CACHE[mod_id] = str(mod_id)
+    return _NAME_CACHE[mod_id]
+
+
+def page_url(mod_id):
+    return f"https://www.nexusmods.com/{NEXUS_GAME}/mods/{mod_id}"
+
+
+def _installed_nexus_ids(ns=None):
+    if ns is None:
+        _cfg, ns = cfg_load()
+    out = {}
+    for slug, e in (ns.get("mods") or {}).items():
+        if e.get("nexus_id"):
+            out[int(e["nexus_id"])] = slug
+    return out
+
+
+def _framework_by_name(nome):
+    """Il core mod che si chiama cosi', se esiste. Confronto sui nomi e non su
+    ID cablati: gli ID Nexus cambiano, e i core mod da noi arrivano da GitHub."""
+    k = re.sub(r"[^a-z0-9]+", "", (nome or "").lower())
+    for f in FRAMEWORKS:
+        if k and k == re.sub(r"[^a-z0-9]+", "", f.lower()):
+            return f
+    return ""
+
+
+def skip_reason(mod_id, api_key, install, have):
+    """Perche' questa dipendenza non va installata, o stringa vuota.
+
+    Il caso non ovvio e' il secondo: i core mod pakrat li prende dalle release
+    GitHub, quindi nel config non hanno un ID Nexus e 'have' non li vede. Senza
+    questo controllo una catena di dipendenze reinstallerebbe ArchiveXL e
+    compagnia da Nexus, sopra quelli che ci sono gia'.
+    """
+    if mod_id in have:
+        return "gia' installata"
+    f = _framework_by_name(mod_name(mod_id, api_key))
+    if f and framework_present(f, install):
+        return f"gia' presente come core mod ({f})"
+    return ""
+
+
+def expand_reqs(ids, api_key, install, depth=1):
+    """Gli ID da installare, prerequisiti prima. Salta quelli gia' installati.
+
+    Si scende di un livello solo: due livelli su una descrizione scritta a mano
+    portano dentro mezzo Nexus, e il rapporto fra veri prerequisiti e rumore
+    peggiora in fretta.
+    """
+    have = _installed_nexus_ids()
+    out, seen = [], set()
+
+    def add(i, root=False):
+        if i in seen:
+            return
+        seen.add(i)
+        why = "" if root else skip_reason(i, api_key, install, have)
+        if why:
+            print(f"  {mod_name(i, api_key)}: {why}, salto")
+            return
+        out.append(i)
+
+    for mod_id in ids:
+        try:
+            reqs = [(i, f, l) for i, f, l in page_requirements(mod_id, api_key)
+                    if f == "richiesto"]
+        except Exception as ex:
+            print(f"  dipendenze di {mod_id} non leggibili: {ex}", file=sys.stderr)
+            reqs = []
+        for i, _f, _l in reqs:
+            if depth > 1:
+                for j, f2, _l2 in page_requirements(i, api_key):
+                    if f2 == "richiesto":
+                        add(j)
+            add(i)
+        add(mod_id, root=True)
+    return out
+
+
+def cmd_reqs(args):
+    """Cosa pretende una mod, dedotto dalla sua pagina Nexus."""
+    if not args:
+        print("uso: pakrat cp2077 reqs ID|URL", file=sys.stderr)
+        return 1
+    mod_id = parse_ref(args[0])
+    if not mod_id:
+        print(f"non e' un ID o un URL di mod: {args[0]}", file=sys.stderr)
+        return 1
+    api_key = core().load_config().get("nexus_api_key")
+    if not api_key:
+        print("API key non configurata: pakrat apikey LA_TUA_CHIAVE", file=sys.stderr)
+        return 1
+    try:
+        info = nexus_get(f"/mods/{mod_id}.json", api_key)
+        reqs = page_requirements(mod_id, api_key, info)
+    except Exception as ex:
+        print(f"errore: {ex}", file=sys.stderr)
+        return 1
+    print(f"{info.get('name')} (v{info.get('version') or '?'})\n")
+    if not reqs:
+        print("nessun prerequisito linkato nella descrizione.")
+        print("Non vuol dire che non ne abbia: vuol dire che l'autore non l'ha\n"
+              "scritto in modo leggibile da qui. Controlla la pagina:\n  "
+              + page_url(mod_id))
+        return 0
+    have = _installed_nexus_ids()
+    install = resolve_install_dir()
+    reqs.sort(key=lambda r: (r[1] != "richiesto", r[0]))
+    shown = 0
+    for i, forza, line in reqs:
+        if forza == "citato" and shown >= 6:
+            continue
+        shown += 1 if forza == "citato" else 0
+        mark = "gia' installata" if i in have else ""
+        print(f"  [{forza:<9}] {i:>6}  {mod_name(i, api_key)[:44]:<44} {mark}")
+        print(f"              \"{line[:96]}\"")
+    resto = sum(1 for _i, f, _l in reqs if f == "citato") - shown
+    if resto > 0:
+        print(f"  ... e altre {resto} citate nella descrizione (mod dell'autore,\n"
+              "      alternative, ringraziamenti): non le tocco")
+    print("\n'richiesto' e 'citato' li deduco dalla frase in cui compare il link:\n"
+          "l'API Nexus i Requirements non li espone, la pagina web si'. Controlla\n"
+          "prima di fidarti:  " + page_url(mod_id))
+    if install:
+        miss = [i for i, f, _l in reqs if f == "richiesto" and i not in have]
+        if miss:
+            print(f"\ninstalla mod e prerequisiti: "
+                  f"pakrat cp2077 get {mod_id} --with-reqs")
+    return 0
+
+
+# ------------------------------------------------------- corpi (body mod) ---
+# Cyberpunk non ha "il" body replacer: ne ha famiglie che si escludono a vicenda,
+# perche' sostituiscono la stessa mesh. Sceglierne uno e' quindi una decisione,
+# non un'installazione, e le conseguenze non sono ovvie: un corpo che cambia le
+# forme (sculpt) richiede che i VESTITI siano rifatti su quelle forme, altrimenti
+# compenetrano. I "refit" sono mod a parte, una per outfit.
+#
+# Questa tabella e' l'unica parte scritta a mano del meccanismo, e serve perche'
+# l'API non sa dire ne' "questa mod e' un corpo" ne' "questa esclude quest'altra".
+# I numeri di diffusione NON stanno qui: si chiedono a Nexus al momento, cosi' non
+# invecchiano. La selezione e' quella dei piu' scaricati al 2026-08-16.
+BODIES = [
+    {"id": 7054, "nome": "VTK Vanilla HD Body for FemV", "fam": "VTK",
+     "chi": "V femmina", "tipo": "sculpt",
+     "nota": "resta fedele alla forma vanilla; e' la base su cui poggiano quasi "
+             "tutti gli altri corpi femminili"},
+    {"id": 4654, "nome": "Enhanced Big Breasts (EBB)", "fam": "VTK",
+     "chi": "V femmina", "tipo": "sculpt",
+     "nota": "forme molto piu' pronunciate; poggia su VTK, non lo sostituisce"},
+    {"id": 1424, "nome": "spawn0 - BODY MOD 2.0", "fam": "spawn0",
+     "chi": "V femmina", "tipo": "rig",
+     "nota": "cambia le PROPORZIONI dal menu, in gioco: niente refit dei vestiti"},
+    {"id": 3667, "nome": "spawn0 - HIGH POLY BODY", "fam": "spawn0",
+     "chi": "V femmina", "tipo": "sculpt",
+     "nota": "mesh ad alta densita', stessa famiglia di BODY MOD 2.0"},
+    {"id": 6423, "nome": "Gymfiend - Body Mod - Male V", "fam": "VTK",
+     "chi": "V maschio", "tipo": "sculpt",
+     "nota": "l'equivalente VTK per V maschile"},
+    {"id": 3725, "nome": "Framework - Unique V Body Shape - Rig", "fam": "rig",
+     "chi": "V", "tipo": "rig",
+     "nota": "storico, l'autore lo marca LEGACY: da' a V una forma diversa dagli "
+             "NPC senza toccare le mesh"},
+]
+
+# I download si chiedono al feed statistico pubblico di Nexus invece che all'API:
+# una richiesta sola copre tutte le mod del gioco, non serve la chiave, e non si
+# consuma quota. Il filtro GraphQL per piu' modId non serve allo scopo — mette in
+# AND gli ID, quindi con due ID non torna mai niente.
+STATS_URL = "https://staticstats.nexusmods.com/live_download_counts/mods/3333.csv"
+STATS_TTL = 12 * 3600
+
+
+def download_counts():
+    """{mod_id: (download totali, utenti distinti)}, {} se non raggiungibile."""
+    import urllib.request
+    cache = os.path.join(core().CONFIG_DIR, "cache", "cp2077-downloads.csv")
+    fresh = (os.path.isfile(cache)
+             and time.time() - os.stat(cache).st_mtime < STATS_TTL)
+    if not fresh:
+        try:
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            req = urllib.request.Request(STATS_URL,
+                                         headers={"User-Agent": core().USER_AGENT})
+            with urllib.request.urlopen(req, timeout=25) as r:
+                data = r.read()
+            with open(cache, "wb") as f:
+                f.write(data)
+        except Exception:
+            if not os.path.isfile(cache):
+                return {}
+    out = {}
+    try:
+        with open(cache, errors="replace") as f:
+            for line in f:
+                p = line.split(",")
+                if len(p) >= 3 and p[0].isdigit():
+                    out[int(p[0])] = (int(p[1]), int(p[2]))
+    except (OSError, ValueError):
+        return {}
+    return out
+
+# Corpi diversi della stessa famiglia, o di famiglie diverse, si sovrascrivono:
+# installarne due e' il modo piu' rapido per non capire piu' cosa si sta vedendo.
+BODY_KEYS = {b["id"] for b in BODIES}
+
+
+def cmd_body(args):
+    """Scegli un corpo e installa quello che serve per farlo funzionare."""
+    install = resolve_install_dir()
+    if not install:
+        return _no_install()
+    api_key = core().load_config().get("nexus_api_key")
+    if not api_key:
+        print("API key non configurata: pakrat apikey LA_TUA_CHIAVE", file=sys.stderr)
+        return 1
+    stats = download_counts()
+    have = _installed_nexus_ids()
+    refs = [a for a in args if not a.startswith("-")]
+
+    if not refs:
+        print("corpi per V (uno per volta: si sostituiscono la stessa mesh)\n")
+        print(f"{'#':>2}  {'ID':>5}  {'CORPO':<38} {'CHI':<10} {'TIPO':<7} "
+              f"{'UTENTI':>9}")
+        for i, b in enumerate(BODIES, 1):
+            _dl, uniq = stats.get(b["id"], (0, 0))
+            mark = "  *" if b["id"] in have else ""
+            print(f"{i:>2}  {b['id']:>5}  {b['nome'][:38]:<38} {b['chi']:<10} "
+                  f"{b['tipo']:<7} {uniq:>9}{mark}")
+            print(f"      {b['nota']}")
+        if any(b["id"] in have for b in BODIES):
+            print("\n* gia' installato")
+        print("\nsculpt = rifa' la mesh: i VESTITI vanno rifatti su quella forma\n"
+              "         (i 'refit' sono mod a parte, una per outfit) — e' qui che\n"
+              "         sta il grosso del lavoro, e pakrat non lo puo' fare per te\n"
+              "rig    = cambia le proporzioni dello scheletro: nessun refit\n")
+        print("per installarne uno:  pakrat cp2077 body N   (o l'ID Nexus)")
+        print("cosa pretende uno:    pakrat cp2077 reqs ID")
+        return 0
+
+    ref = refs[0]
+    b = None
+    if ref.isdigit() and 1 <= int(ref) <= len(BODIES):
+        b = BODIES[int(ref) - 1]
+    else:
+        mid = parse_ref(ref)
+        b = next((x for x in BODIES if x["id"] == mid), None)
+        if b is None and mid:
+            b = {"id": mid, "fam": "?", "chi": "?", "tipo": "?",
+                 "nota": "non e' fra i corpi che conosco: procedo lo stesso"}
+    if b is None:
+        print(f"non e' un indice ne' un ID: {ref}", file=sys.stderr)
+        return 1
+
+    conflitti = [x for x in BODIES if x["id"] in have and x["id"] != b["id"]
+                 and x["chi"] == b.get("chi")]
+    print(f"{b.get('nome') or b['id']}  ({b['chi']}, {b['tipo']})")
+    print(f"  {b['nota']}\n")
+    if conflitti:
+        print("gia' installati per lo stesso personaggio:")
+        for x in conflitti:
+            print(f"  {x['nome']}")
+        print("  due corpi sulla stessa mesh non si sommano: vince l'ordine di\n"
+              "  caricamento, e non e' quello che vuoi. Disattiva l'altro con\n"
+              "  'pakrat cp2077 disable' prima o dopo.\n")
+
+    print("dipendenze dedotte dalla pagina Nexus:")
+    try:
+        reqs = page_requirements(b["id"], api_key)
+    except Exception as ex:
+        print(f"  non leggibili: {ex}", file=sys.stderr)
+        reqs = []
+    need, salti = [], {}
+    for i, f, _l in reqs:
+        if f != "richiesto":
+            continue
+        why = skip_reason(i, api_key, install, have)
+        salti[i] = why
+        if not why:
+            need.append(i)
+    for i, f, line in sorted(reqs, key=lambda r: r[1] != "richiesto"):
+        if f != "richiesto":
+            continue
+        stato = f"  ({salti.get(i)})" if salti.get(i) else ""
+        print(f"  {i:>6}  {mod_name(i, api_key)[:46]:<46}{stato}")
+        print(f"          \"{line[:88]}\"")
+    citate = [i for i, f, _l in reqs if f == "citato"]
+    if not need and not any(f == "richiesto" for _i, f, _l in reqs):
+        print("  nessuna dichiarata come richiesta nella descrizione")
+    if citate:
+        print(f"  (+{len(citate)} mod citate ma non dichiarate necessarie: refit dei\n"
+              "   vestiti, texture, alternative — quelle le scegli tu)")
+    print(f"\n  pagina: {page_url(b['id'])}")
+
+    plan = need + [b["id"]] if b["id"] not in have else need
+    if not plan:
+        print("\nnon c'e' niente da installare: e' gia' tutto qui.")
+        return 0
+    print("\ninstallerei, in quest'ordine: " + ", ".join(str(i) for i in plan))
+    if "--dry-run" in args:
+        print("(--dry-run: non ho scaricato niente)")
+        return 0
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("da script non installo senza conferma. Con un terminale, rilancia\n"
+              "senza --dry-run e rispondi si.")
+        return 0
+    if not require_game_closed():
+        return 1
+    try:
+        ans = input("procedo? [s/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    if ans not in ("s", "si", "sì", "y", "yes"):
+        print("ok, non faccio niente.")
+        return 0
+    rc, done = 0, []
+    for i in plan:
+        slug, err = fetch_and_install(i, api_key, install, enable=True)
+        if err:
+            print(f"  {err}", file=sys.stderr)
+            rc = 1
+            continue
+        done.append(slug)
+    if done:
+        print(f"\n{len(done)} installate. Controlla con: pakrat cp2077 list")
+        _cfg, ns = cfg_load()
+        fw = sorted({x for s in done for x in missing_frameworks(
+            (ns.get("mods") or {}).get(s, {}).get("files") or [], install)})
+        offer_bootstrap(fw, install)
     return rc
 
 
@@ -2429,6 +2847,10 @@ HELP = """pakrat cp2077 - Cyberpunk 2077
   search TERMINE        cerca mod su Nexus per nome (--limit N)
   get ID [ID...]        scarica e installa da Nexus per ID (premium)
                         --file FILE_ID sceglie un file preciso
+                        --with-reqs installa prima i prerequisiti dedotti
+  reqs ID               cosa pretende una mod, dedotto dalla pagina Nexus
+  body [N|ID]           elenca i corpi opzionali, o ne installa uno con la
+                        sua catena (--dry-run mostra e basta)
   link MOD ID           associa una mod alla sua pagina Nexus
   check                 cerca aggiornamenti su Nexus
   update [MOD]          scarica e installa gli aggiornamenti
@@ -2465,6 +2887,8 @@ def main(args):
         "deps": lambda: cmd_deps(rest),
         "search": lambda: cmd_search(rest),
         "get": lambda: cmd_get(rest),
+        "reqs": lambda: cmd_reqs(rest),
+        "body": lambda: cmd_body(rest),
         "install": lambda: cmd_get(rest),
         "bootstrap": lambda: cmd_bootstrap(rest),
         "core": lambda: cmd_bootstrap(rest),

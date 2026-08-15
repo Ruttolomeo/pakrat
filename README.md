@@ -151,6 +151,10 @@ pakrat cp2077 deploy        cosa serve per far caricare i REDmod
 pakrat cp2077 doctor        dopo una partita: cosa il gioco ha caricato davvero
 pakrat cp2077 search TERM   cerca mod su Nexus per nome (--limit N)
 pakrat cp2077 get ID        scarica e installa da Nexus per ID (premium)
+                            --with-reqs installa prima i prerequisiti dedotti
+pakrat cp2077 reqs ID       cosa pretende una mod, dedotto dalla sua pagina
+pakrat cp2077 body [N]      elenca i corpi opzionali, o ne installa uno con
+                            la sua catena (--dry-run mostra e basta)
 pakrat cp2077 link MOD ID   associa una mod alla sua pagina Nexus
 pakrat cp2077 check         cerca aggiornamenti
 pakrat cp2077 update [MOD]  scarica e installa gli aggiornamenti
@@ -432,6 +436,41 @@ messaggio, e si guarda se il messaggio nomina una mod — UE4 nel testo dell'err
 mette il percorso dell'oggetto che ha fatto saltare tutto, e per una mod quel
 percorso contiene il nome della sua cartella. E' un'euristica, ma quando becca
 qualcosa e' esattamente quello che stavi cercando.
+
+### Dipendenze fra mod, e i corpi
+
+L'API Nexus **non espone i Requirements** di una mod: stanno solo nella pagina
+web. La descrizione pero' l'API la da', e li' dentro gli autori i prerequisiti li
+**linkano** — con l'URL della mod, quindi con il suo ID. `pakrat cp2077 reqs ID`
+legge quella descrizione e ne ricava la catena, distinguendo *richiesto* da
+*citato* in base alla frase in cui il link compare (o alla sezione: una riga corta
+tipo "1. Install requirements" apre un blocco di prerequisiti). Su Equipment-EX
+ricava esattamente i cinque core mod che l'autore elenca.
+
+E' un'euristica dichiarata, non un grafo di dipendenze: una descrizione linka
+anche le mod consigliate, i refit alternativi e i ringraziamenti. Per questo non
+si installa niente senza mostrare prima la catena, e `get --with-reqs` scende di
+**un solo livello** — due, su testo scritto a mano, tirano dentro mezzo Nexus.
+
+Un prerequisito gia' soddisfatto viene saltato, e non solo guardando gli ID Nexus
+gia' associati: i core mod pakrat li prende dalle **release GitHub**, quindi nel
+config un ID Nexus non ce l'hanno. Il confronto avviene allora sul nome, contro la
+tabella `FRAMEWORKS`; senza, una catena reinstallerebbe ArchiveXL da Nexus sopra
+quello che c'e' gia'.
+
+**`pakrat cp2077 body`** e' l'applicazione pratica: Cyberpunk non ha *il* body
+replacer, ne ha famiglie che si **escludono a vicenda** perche' sostituiscono la
+stessa mesh. Il comando elenca i piu' diffusi con il numero di utenti reale —
+preso dal feed statistico pubblico di Nexus (una richiesta, nessuna chiave, nessuna
+quota consumata) e non da una tabella che invecchia — e installando ne risolve la
+catena, avvisando se un altro corpo per lo stesso personaggio e' gia' li'.
+
+L'elenco dei corpi e' l'unico pezzo scritto a mano, e non poteva essere altrimenti:
+l'API non sa dire ne' "questa mod e' un corpo" ne' "questa esclude quest'altra".
+Con esso il comando dichiara la cosa che conta davvero e che nessuna automazione
+risolve — un corpo *sculpt* rifa' la mesh, quindi i **vestiti** vanno rifatti su
+quella forma, e i refit sono mod a parte, una per outfit. Un corpo *rig* cambia le
+proporzioni dello scheletro e non ne ha bisogno.
 
 **REDmod**: pakrat prepara `mods/` ma **non lancia `redMod.exe deploy`**, che e' un
 eseguibile Windows — questo tool non dipende da Wine e non e' il caso di iniziare
