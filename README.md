@@ -137,6 +137,7 @@ pakrat cp2077 restore [N]   elenca l'archivio, o ripristina una mod rimossa
 pakrat cp2077 verify        confronta il manifest col disco, trova gli orfani
 pakrat cp2077 deps          stato dei core mod e prerequisiti dedotti
 pakrat cp2077 bootstrap     scarica e installa i core mod mancanti, in ordine
+                            NOME==1.36.0 fissa una versione, NOME==latest libera
                             --dry-run mostra cosa farebbe, --force reinstalla
 pakrat cp2077 deploy        cosa serve per far caricare i REDmod
 pakrat cp2077 link MOD ID   associa una mod alla sua pagina Nexus
@@ -271,6 +272,29 @@ via Proton: se dopo il bootstrap il gioco non parte piu', `pakrat cp2077 disable
 su quello appena messo e' il primo passo per capire chi e' — e il tool lo dice
 anche a fine installazione.
 
+### Fissare una versione
+
+Il caso che rende necessario il pin e' preciso: **Cyberpunk si aggiorna e
+l'ultima CET o redscript non e' ancora allineata**, quindi il gioco non parte.
+Serve tornare a quella che funzionava, e soprattutto che non torni avanti da
+sola al prossimo `bootstrap`.
+
+```
+pakrat cp2077 bootstrap cet==1.36.0    installa quella versione e la fissa
+pakrat cp2077 bootstrap                le altre si aggiornano, CET no
+pakrat cp2077 bootstrap cet==latest    toglie il pin e riprende l'ultima
+```
+
+Il pin viene **ricordato** (`pinned_version` nella config) ed e' l'unica cosa che
+ferma un aggiornamento: senza, `bootstrap` prende sempre l'ultima release. Se
+chiedi una versione che hai gia' installata, non reinstalla niente e mette solo
+il pin. `deps` mostra quale versione c'e' e se e' fissata.
+
+Il numero si scrive nudo (`1.36.0`) o col tag (`v1.36.0`), indifferentemente. I
+core mod si indicano per nome o con gli abbreviativi d'uso — `cet`, `axl`, `txl`,
+`reds`, `r4e` — e un nome che non corrisponde a niente e' un errore, non un
+silenzioso "non ho fatto nulla".
+
 **REDmod**: pakrat prepara `mods/` ma **non lancia `redMod.exe deploy`**, che e' un
 eseguibile Windows — questo tool non dipende da Wine e non e' il caso di iniziare
 qui. Il deploy lo fa REDprelauncher all'avvio, se il gioco parte con `-modded`.
@@ -365,6 +389,11 @@ va a buon fine su un'installazione finta, e rilanciarlo li salta. Provata anche 
 proposta automatica in tutte e tre le strade — accettata (installa solo i quattro
 che servivano, RED4ext per primo), rifiutata, e senza terminale (stampa il comando
 senza chiedere).
+
+Il pin e' collaudato sullo scenario per cui esiste, sempre contro release vere:
+installata l'ultima CET, tornati a 1.36.0 (che si fissa da sola), verificato che
+un `bootstrap` generico successivo la lasci dov'e' mentre aggiorna le altre, e
+che `cet==latest` tolga il pin e riprenda l'ultima.
 
 Non ancora verificati: il flusso `nxm://` per BG3 (quello di MW5 sì), `mw5 update`
 su una mod che ha effettivamente una versione nuova, e l'estrazione di archivi

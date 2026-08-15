@@ -150,24 +150,100 @@ CORE_SOURCES = [
     ("Codeware",            "psiberx/cp2077-codeware",   r"^Codeware-[\d.]+\.zip$"),
 ]
 
+# Come li chiama la gente. Senza questi 'bootstrap cet' non troverebbe niente:
+# "cet" non e' una sottostringa di "Cyber Engine Tweaks".
+CORE_ALIASES = {
+    "cet": "Cyber Engine Tweaks",
+    "cyberenginetweaks": "Cyber Engine Tweaks",
+    "cyber": "Cyber Engine Tweaks",
+    "red4ext": "RED4ext",
+    "r4e": "RED4ext",
+    "redscript": "redscript",
+    "reds": "redscript",
+    "archivexl": "ArchiveXL",
+    "axl": "ArchiveXL",
+    "tweakxl": "TweakXL",
+    "txl": "TweakXL",
+    "codeware": "Codeware",
+}
 
-def github_latest(repo, asset_re):
-    """(tag, nome_asset, url) dell'ultima release, o None se non si trova.
 
-    Niente token: l'API pubblica basta e il limite di 60 richieste/ora e'
-    abbondante per sei repo.
+def core_match(token):
+    """Il core mod indicato da un token, o None. Alias, nome esatto o pezzo di nome."""
+    t = token.strip().lower()
+    if t in CORE_ALIASES:
+        return CORE_ALIASES[t]
+    names = [n for n, _r, _a in CORE_SOURCES]
+    for n in names:
+        if n.lower() == t:
+            return n
+    hits = [n for n in names if t and t in n.lower()]
+    return hits[0] if len(hits) == 1 else None
+
+
+def parse_core_args(args):
+    """Separa i token in {nome: versione_richiesta}.
+
+    'NOME' vuol dire "l'ultima", 'NOME==1.36.0' una precisa, 'NOME==latest'
+    toglie il pin. Ritorna anche i token che non corrispondono a niente, perche'
+    ignorarli in silenzio farebbe credere di aver fatto qualcosa.
     """
+    want, bad = {}, []
+    for a in args:
+        if a.startswith("-"):
+            continue
+        tok, _, ver = a.partition("==")
+        name = core_match(tok)
+        if name is None:
+            bad.append(a)
+            continue
+        want[name] = ver.strip() or None
+    return want, bad
+
+
+def github_release(repo, asset_re, tag=None):
+    """(tag, nome_asset, url) di una release, o None se non si trova.
+
+    Senza tag prende l'ultima. Niente token: l'API pubblica basta e il limite di
+    60 richieste/ora e' abbondante per sei repo.
+    """
+    import urllib.error
     import urllib.request
-    req = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/releases/latest",
-        headers={"User-Agent": "pakrat", "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.load(r)
+    if tag:
+        # su questi repo i tag sono tutti 'vX.Y.Z', ma accettiamo anche il numero
+        # nudo: chi lo scrive a mano lo copia dalla versione, non dal tag
+        cands = [tag] if tag.startswith("v") else [f"v{tag}", tag]
+        data = None
+        for t in cands:
+            url = f"https://api.github.com/repos/{repo}/releases/tags/{t}"
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "pakrat",
+                              "Accept": "application/vnd.github+json"})
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    data = json.load(r)
+                break
+            except urllib.error.HTTPError as ex:
+                if ex.code != 404:
+                    raise
+        if data is None:
+            raise RuntimeError(f"versione {tag} non trovata fra le release di {repo}")
+    else:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{repo}/releases/latest",
+            headers={"User-Agent": "pakrat",
+                     "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.load(r)
     rx = re.compile(asset_re)
     for a in data.get("assets") or []:
         if rx.match(a.get("name") or ""):
             return data.get("tag_name") or "", a["name"], a["browser_download_url"]
     return None
+
+
+def github_latest(repo, asset_re):
+    return github_release(repo, asset_re)
 
 
 STORE_DIRNAME = "pakrat-cp2077"          # accanto all'installazione
@@ -1441,19 +1517,41 @@ def offer_bootstrap(missing, install=None):
     return cmd_bootstrap([n for n in missing])
 
 
+def _pin_write(name, tag):
+    """Fissa (o libera) la versione di un core mod gia' installato."""
+    cfg, ns = cfg_load()
+    e = ns.setdefault("mods", {}).setdefault(name, {})
+    if tag:
+        e["pinned_version"] = tag
+    else:
+        e.pop("pinned_version", None)
+    cfg_save(cfg)
+
+
 def cmd_bootstrap(args):
     """Scarica e installa i core mod dalle loro release GitHub.
 
     Non passa da Nexus di proposito: sono progetti open source con release
     pubbliche, quindi il download e' diretto e non serve un account premium
     (l'API di Nexus i link diretti li da' solo a quelli).
+
+    'NOME==1.36.0' fissa una versione e la ricorda: serve quando il gioco si
+    aggiorna e l'ultima release di CET o redscript non parte ancora: si torna a
+    quella che funziona e i bootstrap successivi non la rimettono avanti finche'
+    non lo dici tu con 'NOME==latest'.
     """
     install = resolve_install_dir()
     if not install:
         return _no_install()
     dry = "--dry-run" in args or "-n" in args
     force = "--force" in args
-    only = [a.lower() for a in args if not a.startswith("-")]
+    want, bad = parse_core_args(args)
+    if bad:
+        print(f"non riconosco: {', '.join(bad)}", file=sys.stderr)
+        print("  core mod: " + ", ".join(n for n, _r, _a in CORE_SOURCES),
+              file=sys.stderr)
+        print("  per fissare una versione: NOME==1.36.0", file=sys.stderr)
+        return 1
     c = core()
     if not require_game_closed():
         return 1
@@ -1462,27 +1560,47 @@ def cmd_bootstrap(args):
     os.makedirs(cache, exist_ok=True)
     rc, did = 0, 0
     for name, repo, asset_re in CORE_SOURCES:
-        if only and not any(o in name.lower() for o in only):
+        if want and name not in want:
             continue
         here = framework_present(name, install)
         _cfg, ns = cfg_load()
         entry = (ns.get("mods") or {}).get(name) or {}
         have = entry.get("installed_version") or ""
+        pinned = entry.get("pinned_version") or ""
+        asked = want.get(name)                  # None = "l'ultima"
+        unpin = str(asked or "").lower() == "latest"
+        if unpin:
+            asked = None
+        # un pin messo apposta non deve saltare via al prossimo bootstrap: e' il
+        # motivo per cui esiste (versione che funziona col gioco che hai adesso)
+        target = asked or (None if unpin else pinned) or None
         try:
-            latest = github_latest(repo, asset_re)
+            rel = github_release(repo, asset_re, target)
         except Exception as ex:
-            print(f"{name}: impossibile interrogare GitHub ({ex})")
+            print(f"{name}: {ex}" if isinstance(ex, RuntimeError)
+                  else f"{name}: impossibile interrogare GitHub ({ex})")
             rc = 1
             continue
-        if latest is None:
-            print(f"{name}: nessun file corrispondente nell'ultima release di {repo}")
+        if rel is None:
+            print(f"{name}: nessun file corrispondente nella release di {repo}")
             rc = 1
             continue
-        tag, fname, url = latest
-        if here and not force and (not have or _vkey(have) >= _vkey(tag)):
-            print(f"{name}: gia' presente{f' ({have})' if have else ''}, salto")
+        tag, fname, url = rel
+        same = have and _vkey(have) == _vkey(tag)
+        if here and not force and (same or (not target and have
+                                            and _vkey(have) >= _vkey(tag))):
+            how = f" ({have}{', fissata' if pinned and not unpin else ''})" if have else ""
+            print(f"{name}: gia' presente{how}, salto")
+            if asked and not pinned:            # chiesta la versione che c'e' gia'
+                _pin_write(name, tag)
+                print(f"    versione fissata a {tag}")
+            elif unpin and pinned:
+                _pin_write(name, None)
+                print("    pin tolto: ai prossimi bootstrap prendera' l'ultima")
             continue
-        if here and have and _vkey(tag) > _vkey(have):
+        if here and have and _vkey(tag) < _vkey(have):
+            print(f"{name}: {have} -> {tag} (torno indietro)")
+        elif here and have:
             print(f"{name}: {have} -> {tag}")
         else:
             print(f"{name}: {tag}")
@@ -1509,6 +1627,12 @@ def cmd_bootstrap(args):
         e["installed_version"] = tag
         e["github"] = repo
         e["github_asset"] = asset_re
+        if asked:
+            e["pinned_version"] = tag
+            print(f"    versione fissata a {tag}: i prossimi bootstrap non la "
+                  "toccheranno")
+        elif unpin:
+            e.pop("pinned_version", None)
         cfg_save(cfg)
         did += 1
 
@@ -1538,7 +1662,11 @@ def cmd_deps(_args=None):
     absent = []
     for name, meta in FRAMEWORKS.items():
         here = framework_present(name, install)
-        print(f"  {'X' if here else ' '}  {name:<22} {meta['why']}")
+        e = (ns.get("mods") or {}).get(name) or {}
+        ver = e.get("installed_version") or ""
+        if ver and e.get("pinned_version"):
+            ver += " (fissata)"
+        print(f"  {'X' if here else ' '}  {name:<22} {ver:<18} {meta['why']}")
         if not here:
             absent.append(name)
     print("\nprerequisiti dedotti dai file di ogni mod:\n")
@@ -1858,6 +1986,8 @@ HELP = """pakrat cp2077 - Cyberpunk 2077
   verify                confronta il manifest col disco, trova gli orfani
   deps                  stato dei core mod e prerequisiti dedotti
   bootstrap [NOME...]   scarica e installa i core mod mancanti, in ordine
+                        NOME==1.36.0 fissa una versione (i bootstrap successivi
+                        non la toccano), NOME==latest toglie il pin
                         --dry-run mostra cosa farebbe, --force reinstalla
   deploy                cosa serve per far caricare i REDmod
   link MOD ID           associa una mod alla sua pagina Nexus
