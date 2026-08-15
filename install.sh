@@ -74,12 +74,12 @@ Type=Application
 Version=1.0
 Name=pakrat
 GenericName=Gestore mod
-Comment=Gestisce mod e load order di Baldur's Gate 3 e MechWarrior 5 (nativo, senza Wine)
+Comment=Gestisce mod e load order di Baldur's Gate 3, MechWarrior 5 e Cyberpunk 2077 (nativo, senza Wine)
 Exec=$BIN/pakrat-gui %f
 Icon=$icon_name
 Terminal=false
 Categories=Game;
-Keywords=bg3;baldur;mechwarrior;mw5;mod;nexus;larian;
+Keywords=bg3;baldur;mechwarrior;mw5;cyberpunk;cp2077;mod;nexus;larian;
 StartupNotify=true
 StartupWMClass=pakrat
 EOF
@@ -109,5 +109,6 @@ command -v kbuildsycoca6 >/dev/null && kbuildsycoca6 --noincremental >/dev/null 
 echo
 echo "fatto. Prova con:  pakrat list          (Baldur's Gate 3)"
 echo "                  pakrat mw5 list      (MechWarrior 5)"
+echo "                  pakrat cp2077 list   (Cyberpunk 2077)"
 echo "Per gli aggiornamenti da Nexus:  pakrat apikey LA_TUA_CHIAVE"
 echo "Per i pulsanti 'Mod Manager Download' di Nexus:  pakrat handler"
