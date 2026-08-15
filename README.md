@@ -146,6 +146,7 @@ pakrat cp2077 bootstrap     scarica e installa i core mod mancanti, in ordine
                             NOME==1.36.0 fissa una versione, NOME==latest libera
                             --dry-run mostra cosa farebbe, --force reinstalla
 pakrat cp2077 deploy        cosa serve per far caricare i REDmod
+pakrat cp2077 search TERM   cerca mod su Nexus per nome (--limit N)
 pakrat cp2077 link MOD ID   associa una mod alla sua pagina Nexus
 pakrat cp2077 check         cerca aggiornamenti
 pakrat cp2077 update [MOD]  scarica e installa gli aggiornamenti
@@ -209,6 +210,28 @@ Il prefisso sul nome e' reversibile e non puo' far sparire una mod.
 
 `verify` confronta il manifest col disco: dice quali file mancano all'appello e
 quali file in `archive/pc/mod` non sono gestiti da pakrat (installati a mano).
+
+### Cercare mod
+
+`pakrat cp2077 search TERMINE` cerca su Nexus per nome, alla maniera di `apt
+search`, e segna con `*` quelle che hai gia' installato e collegato.
+
+```
+  #      ID  MOD                                            VERSIONE  AUTORE
+  1*   6945  Equipment-EX                                      1.2.9  psiberx
+  2    7049  Toggleable Feet for V - ArchiveXL and Equipm        1.0  xBaebsae
+```
+
+Una cosa e' bene saperla, perche' altrimenti sembra che la ricerca funzioni male:
+**il filtro di Nexus fa match su sottostringa, non su parole simili**. Un refuso
+dentro una parola (`equpment`) non restituisce niente, e da qui non si puo'
+rimediare — servirebbe un indice locale di tutte le mod del gioco. Quello che
+pakrat fa e' cercare anche le singole parole quando la frase intera non da'
+risultati, e riordinare per somiglianza cio' che torna, cosi' il risultato piu'
+pertinente sta in cima invece che in mezzo.
+
+Il download non passa da qui: si prende dalla pagina (o col pulsante "Mod Manager
+Download", che pakrat gestisce via `nxm://`) e poi `add` piu' `link`.
 
 ### Prerequisiti (core mod)
 

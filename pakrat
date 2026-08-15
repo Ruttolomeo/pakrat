@@ -678,9 +678,11 @@ def nexus_graphql(query, variables, api_key):
     return d.get("data", {})
 
 
-def nexus_search(term, api_key, count=25):
+def nexus_search(term, api_key, count=25, game=NEXUS_GAME):
+    """Cerca mod per nome. Il termine va passato nudo: l'operatore WILDCARD fa
+    gia' match su sottostringa, e aggiungere '*' a mano non trova piu' niente."""
     data = nexus_graphql(_GQL_SEARCH, {
-        "f": {"gameDomainName": [{"value": "baldursgate3", "op": "EQUALS"}],
+        "f": {"gameDomainName": [{"value": game, "op": "EQUALS"}],
               "name": [{"value": term, "op": "WILDCARD"}]},
         "c": count}, api_key)
     return data.get("mods", {}).get("nodes", []) or []

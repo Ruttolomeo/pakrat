@@ -1728,6 +1728,103 @@ def cmd_deploy(_args=None):
     return 0
 
 
+def _fuzzy(a, b):
+    """0..1 di somiglianza fra due nomi, ignorando spazi e punteggiatura."""
+    import difflib
+    na = re.sub(r"[^a-z0-9]+", "", (a or "").lower())
+    nb = re.sub(r"[^a-z0-9]+", "", (b or "").lower())
+    if not na or not nb:
+        return 0.0
+    r = difflib.SequenceMatcher(None, na, nb).ratio()
+    if na in nb:                      # "equipment ex" dentro "equipment-ex ..."
+        r = max(r, 0.75 + 0.25 * len(na) / len(nb))
+    return r
+
+
+def search_nexus(term, api_key, limit=15):
+    """Cerca su Nexus e ordina per somiglianza col termine.
+
+    Il filtro del server fa match su SOTTOSTRINGA, non approssimato: se sbagli
+    una lettera dentro una parola non trova niente, e non c'e' modo di rimediare
+    da qui. Quello che si puo' fare, e che si fa, e' cercare anche le singole
+    parole quando la frase intera non da' risultati, e riordinare per
+    somiglianza cio' che torna.
+    """
+    c = core()
+    found, tried = {}, [term]
+    for n in c.nexus_search(term, api_key, count=40, game=NEXUS_GAME):
+        found[n["modId"]] = n
+    if not found:
+        words = [w for w in re.split(r"\s+", term.strip()) if len(w) > 2]
+        for w in words[:3]:
+            tried.append(w)
+            try:
+                for n in c.nexus_search(w, api_key, count=25, game=NEXUS_GAME):
+                    found[n["modId"]] = n
+            except Exception:
+                continue
+    ranked = sorted(found.values(), key=lambda n: -_fuzzy(term, n.get("name")))
+    return ranked[:limit], tried
+
+
+def cmd_search(args):
+    """Cerca mod su Nexus per nome, alla maniera di 'apt search'."""
+    terms = [a for a in args if not a.startswith("-")]
+    if not terms:
+        print("uso: pakrat cp2077 search TERMINE [--limit N]", file=sys.stderr)
+        return 1
+    limit = 15
+    if "--limit" in args:
+        i = args.index("--limit")
+        if i + 1 < len(args) and args[i + 1].isdigit():
+            limit = int(args[i + 1])
+            terms = [t for t in terms if t != args[i + 1]]
+    term = " ".join(terms)
+    c = core()
+    cfg = c.load_config()
+    api_key = cfg.get("nexus_api_key")
+    if not api_key:
+        print("API key non configurata: pakrat apikey LA_TUA_CHIAVE", file=sys.stderr)
+        return 1
+    try:
+        hits, tried = search_nexus(term, api_key, limit)
+    except Exception as ex:
+        print(f"ricerca fallita: {ex}", file=sys.stderr)
+        return 1
+    if not hits:
+        print(f"nessun risultato per '{term}'.")
+        print("  il filtro di Nexus cerca sottostringhe, non parole simili:\n"
+              "  un refuso dentro una parola non da' risultati. Prova un pezzo\n"
+              "  piu' corto del nome, o una parola sola.")
+        return 1
+
+    # quali sono gia' installate: e' l'informazione che serve guardando una lista
+    _cfg, ns = cfg_load()
+    known = {}
+    for slug, e in (ns.get("mods") or {}).items():
+        if e.get("nexus_id"):
+            known[int(e["nexus_id"])] = slug
+    if len(tried) > 1:
+        print(f"(nessun risultato per '{term}', ho cercato: "
+              f"{', '.join(repr(t) for t in tried[1:])})\n")
+    print(f"{'#':>3}  {'ID':>6}  {'MOD':<44} {'VERSIONE':>10}  AUTORE")
+    for i, n in enumerate(hits, 1):
+        mid = n["modId"]
+        name = str(n.get("name") or "")[:44]
+        ver = str(n.get("version") or "")[:10]
+        who = str((n.get("uploader") or {}).get("name") or "")[:18]
+        flags = " [18+]" if n.get("adultContent") else ""
+        mark = "*" if mid in known else " "
+        print(f"{i:3}{mark} {mid:>6}  {name:<44} {ver:>10}  {who}{flags}")
+    if any(n["modId"] in known for n in hits):
+        print("\n* gia' installata e collegata a Nexus")
+    print("\npagina di una mod:  "
+          f"https://www.nexusmods.com/{NEXUS_GAME}/mods/ID")
+    print("una volta scaricata: pakrat cp2077 add ARCHIVIO.zip"
+          "  poi  pakrat cp2077 link MOD ID")
+    return 0
+
+
 def cmd_link(args):
     if len(args) < 2:
         print("uso: pakrat cp2077 link MOD ID|URL", file=sys.stderr)
@@ -1990,6 +2087,7 @@ HELP = """pakrat cp2077 - Cyberpunk 2077
                         non la toccano), NOME==latest toglie il pin
                         --dry-run mostra cosa farebbe, --force reinstalla
   deploy                cosa serve per far caricare i REDmod
+  search TERMINE        cerca mod su Nexus per nome (--limit N)
   link MOD ID           associa una mod alla sua pagina Nexus
   check                 cerca aggiornamenti su Nexus
   update [MOD]          scarica e installa gli aggiornamenti
@@ -2023,6 +2121,7 @@ def main(args):
         "restore": lambda: cmd_restore(rest),
         "verify": lambda: cmd_verify(rest),
         "deps": lambda: cmd_deps(rest),
+        "search": lambda: cmd_search(rest),
         "bootstrap": lambda: cmd_bootstrap(rest),
         "core": lambda: cmd_bootstrap(rest),
         "deploy": lambda: cmd_deploy(rest),
