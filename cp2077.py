@@ -1712,6 +1712,137 @@ def cmd_deps(_args=None):
     return 0
 
 
+# I due loader nativi non si installano come plugin: si sostituiscono a una DLL
+# di sistema che l'eseguibile carica comunque (DLL hijacking). E' il punto in cui
+# tutto lo stack si rompe su Linux, perche' Proton puo' non caricarli.
+LOADERS = [
+    ("RED4ext", "bin/x64/winmm.dll", "winmm"),
+    ("Cyber Engine Tweaks", "bin/x64/version.dll", "version"),
+]
+
+# Dove i framework scrivono. Si scandiscono le cartelle invece di cercare nomi
+# di file precisi: le convenzioni cambiano fra versioni, l'esistenza di un log
+# fresco no.
+LOG_DIRS = [
+    "red4ext/logs",
+    "r6/logs",
+    "bin/x64/plugins/cyber_engine_tweaks",
+]
+
+_ERR_RE = re.compile(r"\b(error|errore|failed|failure|exception|panic|fatal)\b", re.I)
+
+
+def _age(ts, now=None):
+    d = int((now or time.time()) - ts)
+    if d < 0:
+        return "nel futuro"
+    for lim, div, unit in ((90, 1, "s"), (5400, 60, "min"), (172800, 3600, "ore")):
+        if d < lim:
+            return f"{d // div} {unit} fa"
+    return f"{d // 86400} giorni fa"
+
+
+def _scan_logs(install):
+    """[(percorso_relativo, mtime, righe_di_errore)] dei log trovati."""
+    out = []
+    for d in LOG_DIRS:
+        p = os.path.join(install, d.replace("/", os.sep))
+        if not os.path.isdir(p):
+            continue
+        for root, _dirs, files in os.walk(p):
+            for fn in files:
+                if not fn.lower().endswith(".log"):
+                    continue
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, install).replace(os.sep, "/")
+                try:
+                    st = os.stat(full)
+                    with open(full, "r", errors="replace") as fh:
+                        tail = fh.readlines()[-400:]
+                except OSError:
+                    continue
+                errs = [l.strip() for l in tail if _ERR_RE.search(l)]
+                out.append((rel, st.st_mtime, errs))
+    out.sort(key=lambda x: -x[1])
+    return out
+
+
+def cmd_doctor(_args=None):
+    """Dopo una partita, dice cosa il gioco ha caricato davvero.
+
+    'verify' guarda i file sul disco, che e' un'altra domanda: qui si legge cio'
+    che i framework hanno scritto girando dentro il gioco. E' l'unico modo per
+    distinguere "la mod non c'e'" da "la mod c'e' ma non viene caricata".
+    """
+    install = resolve_install_dir()
+    if not install:
+        return _no_install()
+    _cfg, ns = cfg_load()
+    mods = scan_mods(ns)
+    print(f"installazione: {install}\n")
+
+    print("loader nativi (si sostituiscono a una DLL di sistema):")
+    missing_loader = []
+    for name, rel, dll in LOADERS:
+        here = os.path.isfile(os.path.join(install, rel.replace("/", os.sep)))
+        print(f"  {'X' if here else ' '}  {name:<22} {rel}")
+        if not here:
+            missing_loader.append((name, dll))
+    logs = _scan_logs(install)
+    print()
+    if not logs:
+        print("nessun log trovato: il gioco non e' mai partito con queste mod,\n"
+              "oppure i loader non vengono caricati per niente.\n")
+        if not missing_loader:
+            print("I file ci sono tutti, quindi il sospetto e' Proton: le DLL\n"
+                  "sostitutive vanno abilitate esplicitamente. Nelle variabili\n"
+                  "d'ambiente del gioco (Heroic: Impostazioni -> Avanzate):\n\n"
+                  "  WINEDLLOVERRIDES=winmm=n,b;version=n,b\n\n"
+                  "winmm e' RED4ext, version e' Cyber Engine Tweaks.")
+        else:
+            print("Mancano anche i loader stessi: pakrat cp2077 bootstrap")
+        return 1
+
+    newest = max(t for _r, t, _e in logs)
+    print(f"log trovati (il piu' recente: {_age(newest)}):\n")
+    total_err = 0
+    wide = max(len(r) for r, _t, _e in logs)
+    for rel, ts, errs in logs:
+        total_err += len(errs)
+        n = len(errs)
+        state = ("1 errore" if n == 1 else f"{n} errori") if n else "ok"
+        print(f"  {rel:<{wide}} {_age(ts):>12}  {state}")
+
+    # un log piu' vecchio dell'ultima modifica alle mod descrive un'altra
+    # configurazione: dirlo evita di dare la caccia a un problema gia' risolto
+    last_change = max([int(m.entry.get("installed_at") or 0) for m in mods] or [0])
+    if last_change and last_change > newest:
+        print(f"\n! i log sono piu' vecchi dell'ultima modifica alle mod "
+              f"({_age(last_change)}):\n  rilancia il gioco, quello che leggi qui "
+              "descrive la configurazione precedente")
+
+    if total_err:
+        quanti = "1 riga di errore" if total_err == 1 else f"{total_err} righe di errore"
+        print(f"\n{quanti}:\n")
+        shown = 0
+        for rel, _ts, errs in logs:
+            for line in errs[:3]:
+                print(f"  [{rel.split('/')[-1]}] {line[:110]}")
+                shown += 1
+                if shown >= 12:
+                    break
+            if shown >= 12:
+                break
+    else:
+        print("\nnessun errore nei log: lo stack si carica.")
+
+    red = [m for m in mods if "redmod" in m.kinds and m.enabled]
+    if red:
+        print(f"\n{len(red)} REDmod attive: se non le vedi in gioco manca il flag "
+              "-modded\n  (pakrat cp2077 deploy)")
+    return 0 if not total_err else 1
+
+
 def cmd_deploy(_args=None):
     """Spiega come far deployare i REDmod, senza chiamare Wine."""
     install = resolve_install_dir()
@@ -2211,6 +2342,7 @@ HELP = """pakrat cp2077 - Cyberpunk 2077
                         non la toccano), NOME==latest toglie il pin
                         --dry-run mostra cosa farebbe, --force reinstalla
   deploy                cosa serve per far caricare i REDmod
+  doctor                dopo una partita: cosa il gioco ha caricato davvero
   search TERMINE        cerca mod su Nexus per nome (--limit N)
   get ID [ID...]        scarica e installa da Nexus per ID (premium)
                         --file FILE_ID sceglie un file preciso
@@ -2254,6 +2386,7 @@ def main(args):
         "bootstrap": lambda: cmd_bootstrap(rest),
         "core": lambda: cmd_bootstrap(rest),
         "deploy": lambda: cmd_deploy(rest),
+        "doctor": lambda: cmd_doctor(rest),
         "link": lambda: cmd_link(rest),
         "check": lambda: cmd_check(rest),
         "update": lambda: cmd_update(rest),

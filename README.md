@@ -146,6 +146,7 @@ pakrat cp2077 bootstrap     scarica e installa i core mod mancanti, in ordine
                             NOME==1.36.0 fissa una versione, NOME==latest libera
                             --dry-run mostra cosa farebbe, --force reinstalla
 pakrat cp2077 deploy        cosa serve per far caricare i REDmod
+pakrat cp2077 doctor        dopo una partita: cosa il gioco ha caricato davvero
 pakrat cp2077 search TERM   cerca mod su Nexus per nome (--limit N)
 pakrat cp2077 get ID        scarica e installa da Nexus per ID (premium)
 pakrat cp2077 link MOD ID   associa una mod alla sua pagina Nexus
@@ -335,6 +336,35 @@ Il numero si scrive nudo (`1.36.0`) o col tag (`v1.36.0`), indifferentemente. I
 core mod si indicano per nome o con gli abbreviativi d'uso — `cet`, `axl`, `txl`,
 `reds`, `r4e` — e un nome che non corrisponde a niente e' un errore, non un
 silenzioso "non ho fatto nulla".
+
+### Capire se in gioco le mod ci sono davvero
+
+`verify` guarda i file sul disco, che e' un'altra domanda: dice che la mod e'
+installata, non che il gioco la carichi. `pakrat cp2077 doctor` risponde alla
+seconda, leggendo cio' che i framework hanno scritto **girando dentro il gioco**.
+
+Serve a distinguere i due casi che da fuori si somigliano — "la mod non c'e'" e
+"la mod c'e' ma non viene caricata" — e su Linux il secondo e' il piu' comune.
+RED4ext e Cyber Engine Tweaks non sono plugin: si installano come
+`bin/x64/winmm.dll` e `bin/x64/version.dll`, cioe' si **sostituiscono a una DLL
+di sistema** che l'eseguibile carica comunque. Se Proton non le carica, non
+succede assolutamente niente e nessuno protesta.
+
+`doctor` distingue tre situazioni:
+
+- **nessun log**: il gioco non e' mai partito con queste mod, oppure i loader non
+  vengono caricati. Se i file ci sono tutti, il sospetto e' Proton, e la cura e'
+  `WINEDLLOVERRIDES=winmm=n,b;version=n,b` fra le variabili d'ambiente del gioco
+  (Heroic: Impostazioni → Avanzate). Il comando lo dice esplicitamente.
+- **log presenti**: quali, di quando, e quante righe di errore contengono, con le
+  prime in chiaro.
+- **log piu' vecchi dell'ultima modifica alle mod**: quello che stai leggendo
+  descrive la configurazione precedente. E' l'avviso che evita di dare la caccia
+  a un problema gia' risolto.
+
+Le cartelle si scandiscono (`red4ext/logs`, `r6/logs`, quella di CET) invece di
+cercare nomi di file precisi: le convenzioni cambiano fra versioni, l'esistenza
+di un log fresco no.
 
 **REDmod**: pakrat prepara `mods/` ma **non lancia `redMod.exe deploy`**, che e' un
 eseguibile Windows — questo tool non dipende da Wine e non e' il caso di iniziare
