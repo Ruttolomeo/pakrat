@@ -5,6 +5,8 @@ pakrat - gestore mod nativo Linux (niente Wine, niente mod manager di Windows).
 Baldur's Gate 3: legge i .pak (formato LSPK v18) per ricavarne i metadati e
 gestisce il load order scrivendo modsettings.lsx.
 MechWarrior 5: Mercenaries: vedi mw5.py, il backend dedicato.
+Cyberpunk 2077: vedi cp2077.py, backend a manifest (una mod = un insieme di file
+sparsi sulla radice del gioco, non una cartella sola).
 Ogni scrittura su un file del gioco e' preceduta da un backup automatico.
 
 Uso:
@@ -15,6 +17,7 @@ Uso:
   pakrat backups      elenca i backup di modsettings.lsx
   pakrat restore N    ripristina un backup
   pakrat mw5 ...      backend MechWarrior 5: Mercenaries (vedi: pakrat mw5 help)
+  pakrat cp2077 ...   backend Cyberpunk 2077 (vedi: pakrat cp2077 help)
 
 Copyright (C) 2026 Ruttolomeo
 SPDX-License-Identifier: GPL-3.0-or-later
@@ -1207,15 +1210,34 @@ def cmd_update(target=None):
 
 
 MW5_MODULE = "mw5.py"
+CP2077_MODULE = "cp2077.py"
+
+# Backend per gioco: comando CLI -> (file, nome in sys.modules, domain Nexus).
+# Il domain e' qui e non nel backend perche' serve per instradare un nxm://
+# PRIMA di caricare il modulo.
+BACKENDS = {
+    "mw5": (MW5_MODULE, "pakrat_mw5", "mechwarrior5mercenaries"),
+    "cp2077": (CP2077_MODULE, "pakrat_cp2077", "cyberpunk2077"),
+}
+BACKEND_ALIASES = {"cp": "cp2077", "cyberpunk": "cp2077", "cyberpunk2077": "cp2077"}
 
 
 def mw5_domain():
     """Domain Nexus di MechWarrior 5, senza dover caricare il backend."""
-    return "mechwarrior5mercenaries"
+    return BACKENDS["mw5"][2]
 
 
-def load_mw5():
-    """Carica mw5.py accanto a questo script, o None se non c'e'.
+def backend_for_domain(domain):
+    """Nome del backend che gestisce un domain Nexus, o None."""
+    d = str(domain or "").lower()
+    for name, (_f, _m, dom) in BACKENDS.items():
+        if dom == d:
+            return name
+    return None
+
+
+def load_backend(name):
+    """Carica il backend di un gioco accanto a questo script, o None se manca.
 
     pakrat non ha estensione .py, quindi il backend non puo' importarlo con un
     import normale: ci registriamo in sys.modules come 'pakrat_core' e il modulo
@@ -1223,21 +1245,31 @@ def load_mw5():
     """
     import importlib.machinery
     import importlib.util
-    cached = sys.modules.get("pakrat_mw5")
+    name = BACKEND_ALIASES.get(name, name)
+    spec_info = BACKENDS.get(name)
+    if spec_info is None:
+        return None
+    fname, modname, _dom = spec_info
+    cached = sys.modules.get(modname)
     if cached is not None:
         return cached
-    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), MW5_MODULE)
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), fname)
     if not os.path.isfile(path):
         return None
     me = sys.modules.get(__name__)     # "__main__" da CLI, "pakrat_core" dalla GUI
     if me is not None:
         sys.modules.setdefault("pakrat_core", me)
-    loader = importlib.machinery.SourceFileLoader("pakrat_mw5", path)
-    spec = importlib.util.spec_from_loader("pakrat_mw5", loader)
+    loader = importlib.machinery.SourceFileLoader(modname, path)
+    spec = importlib.util.spec_from_loader(modname, loader)
     m = importlib.util.module_from_spec(spec)
-    sys.modules["pakrat_mw5"] = m
+    sys.modules[modname] = m
     loader.exec_module(m)
     return m
+
+
+def load_mw5():
+    """Compatibilita': la GUI e gli script esistenti chiamano ancora questa."""
+    return load_backend("mw5")
 
 
 def cmd_nxm(url):
@@ -1248,13 +1280,14 @@ def cmd_nxm(url):
         print(f"non e' un link nxm://: {url}", file=sys.stderr)
         return 1
     game = p.netloc
-    if game.lower() == mw5_domain():
-        mw5 = load_mw5()
-        if mw5 is None:
-            print("backend MW5 non installato (manca mw5.py accanto a pakrat)",
-                  file=sys.stderr)
+    name = backend_for_domain(game)
+    if name:
+        be = load_backend(name)
+        if be is None:
+            print(f"backend {name} non installato "
+                  f"(manca {BACKENDS[name][0]} accanto a pakrat)", file=sys.stderr)
             return 1
-        return mw5.cmd_nxm(url)
+        return be.cmd_nxm(url)
     if game.lower() != NEXUS_GAME:
         print(f"gioco non gestito da questo tool: {game}", file=sys.stderr)
         return 1
@@ -1598,16 +1631,17 @@ def main():
         return cmd_setup()
 
     # I comandi di altri giochi non devono pretendere un'installazione di BG3.
-    if args and args[0] == "mw5":
-        mw5 = load_mw5()
-        if mw5 is None:
-            print(f"backend MW5 non installato (manca {MW5_MODULE} accanto a pakrat)",
-                  file=sys.stderr)
+    if args and BACKEND_ALIASES.get(args[0], args[0]) in BACKENDS:
+        name = BACKEND_ALIASES.get(args[0], args[0])
+        be = load_backend(name)
+        if be is None:
+            print(f"backend {name} non installato "
+                  f"(manca {BACKENDS[name][0]} accanto a pakrat)", file=sys.stderr)
             return 1
-        return mw5.main(args[1:])
+        return be.main(args[1:])
     if args and args[0] == "nxm" and len(args) > 1:
         import urllib.parse
-        if urllib.parse.urlparse(args[1]).netloc.lower() == mw5_domain():
+        if backend_for_domain(urllib.parse.urlparse(args[1]).netloc):
             return cmd_nxm(args[1])
 
     if not LARIAN or not os.path.isdir(LARIAN):
