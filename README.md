@@ -350,17 +350,40 @@ RED4ext e Cyber Engine Tweaks non sono plugin: si installano come
 di sistema** che l'eseguibile carica comunque. Se Proton non le carica, non
 succede assolutamente niente e nessuno protesta.
 
-`doctor` distingue tre situazioni:
+Per ogni loader `doctor` dice due cose diverse: se il **file** c'e', e se ha
+**scritto** un log, cioe' se ha girato davvero. Un loader installato che non ha
+mai scritto niente e' il sintomo, e la causa quasi sempre e' una sola.
 
-- **nessun log**: il gioco non e' mai partito con queste mod, oppure i loader non
-  vengono caricati. Se i file ci sono tutti, il sospetto e' Proton, e la cura e'
-  `WINEDLLOVERRIDES=winmm=n,b;version=n,b` fra le variabili d'ambiente del gioco
-  (Heroic: Impostazioni → Avanzate). Il comando lo dice esplicitamente.
-- **log presenti**: quali, di quando, e quante righe di errore contengono, con le
-  prime in chiaro.
-- **log piu' vecchi dell'ultima modifica alle mod**: quello che stai leggendo
-  descrive la configurazione precedente. E' l'avviso che evita di dare la caccia
-  a un problema gia' risolto.
+**L'override delle DLL.** Sotto Proton, Wine preferisce le proprie `winmm` e
+`version` a quelle della cartella del gioco: la DLL del mod resta un file inerte,
+senza un errore e senza una riga di log. Il gioco parte, gli `.archive` si
+vedono, e tutto cio' che passa da RED4ext o CET semplicemente non esiste —
+ArchiveXL, TweakXL e Codeware compresi, che risultano installati e non li carica
+nessuno. La cura e' una variabile d'ambiente:
+
+    WINEDLLOVERRIDES=winmm,version=n,b
+
+Non sta nell'installazione ma nella configurazione del launcher, quindi e'
+l'unico pezzo dello stack che non si vede guardando i file del gioco. Per questo
+pakrat **la legge davvero** invece di limitarsi a consigliarla: trova il gioco
+nell'indice di Heroic, apre il suo `GamesConfig/<appName>.json` e controlla se
+`winmm` e `version` sono forzate native (anche ereditate dalle impostazioni
+globali). `doctor` lo riporta sempre, `verify` e `deps` avvisano in una riga, e
+`bootstrap` lo dice subito dopo aver installato i loader, che e' il momento in cui
+serve saperlo. Se manca, `doctor` si offre di scriverla lui — con backup, e solo
+a Heroic chiuso, perche' Heroic tiene quella configurazione in memoria e una
+modifica fatta mentre e' aperto sparirebbe in silenzio. Su Steam non si legge
+niente e si dice come metterla nelle opzioni di avvio, invece di fingere una
+diagnosi.
+
+Sui log, `doctor` separa l'**ultima corsa** dalle precedenti. Serve piu' di
+quanto sembri: redscript ruota il proprio log all'**inizio** della corsa nuova,
+quindi `redscript_r<data>.log` contiene sempre la partita di prima per quanto
+recente sia il suo mtime, ed e' la trappola per cui si legge un errore gia'
+risolto e lo si insegue una seconda volta. Se gli errori stanno solo li', il
+comando lo dice a chiare lettere. Resta l'avviso di quando i log sono **piu'
+vecchi dell'ultima modifica alle mod**: stai leggendo la configurazione
+precedente, rilancia il gioco.
 
 Le cartelle si scandiscono (`red4ext/logs`, `r6/logs`, quella di CET) invece di
 cercare nomi di file precisi: le convenzioni cambiano fra versioni, l'esistenza

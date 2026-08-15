@@ -1493,6 +1493,10 @@ def cmd_verify(_args=None):
         print("\nprerequisiti mancanti: " + ", ".join(miss_fw)
               + "\n  installali con: pakrat cp2077 bootstrap"
               + "\n  (dettagli: pakrat cp2077 deps)")
+    # il manifest puo' essere perfetto e il gioco caricare zero: qui si guarda il
+    # disco, e il disco non sa niente di come Proton carica le DLL
+    if override_check(install):
+        problems += 1
     if not problems:
         print(f"tutto a posto: {len(mods)} mod, manifest coerente col disco")
     return 0
@@ -1657,6 +1661,15 @@ def cmd_bootstrap(args):
         print("\nRicorda: CET e RED4ext girano dentro il gioco via Proton — se il\n"
               "gioco non parte piu', 'pakrat cp2077 disable' su quello che hai\n"
               "appena messo e' il primo passo per capire chi e'.")
+        # e' il momento in cui serve saperlo: i loader appena installati non
+        # faranno niente finche' Proton non li carica al posto delle sue builtin
+        st = override_state(install)
+        if st["known"] and st["missing"] and any(
+                os.path.isfile(os.path.join(install, rel.replace("/", os.sep)))
+                for _n, rel, _d, _l in LOADERS):
+            print()
+            override_report(st, install)
+            offer_override_fix(st, install)
     else:
         print("\nniente da fare: i core mod risultano gia' installati "
               "(--force per reinstallarli)")
@@ -1681,6 +1694,7 @@ def cmd_deps(_args=None):
         print(f"  {'X' if here else ' '}  {name:<22} {ver:<18} {meta['why']}")
         if not here:
             absent.append(name)
+    override_check(install)
     print("\nprerequisiti dedotti dai file di ogni mod:\n")
     if not mods:
         print("  nessuna mod registrata")
@@ -1715,10 +1729,255 @@ def cmd_deps(_args=None):
 # I due loader nativi non si installano come plugin: si sostituiscono a una DLL
 # di sistema che l'eseguibile carica comunque (DLL hijacking). E' il punto in cui
 # tutto lo stack si rompe su Linux, perche' Proton puo' non caricarli.
+#
+# L'ultimo campo e' dove il loader scrive girando: e' l'unica prova che e' stato
+# caricato davvero. Il file .dll sul disco non dimostra niente.
 LOADERS = [
-    ("RED4ext", "bin/x64/winmm.dll", "winmm"),
-    ("Cyber Engine Tweaks", "bin/x64/version.dll", "version"),
+    ("RED4ext", "bin/x64/winmm.dll", "winmm", "red4ext/logs"),
+    ("Cyber Engine Tweaks", "bin/x64/version.dll", "version",
+     "bin/x64/plugins/cyber_engine_tweaks"),
 ]
+
+# --------------------------------------------- override delle DLL (Proton) ---
+# Su Windows l'eseguibile carica winmm.dll e version.dll dalla propria cartella,
+# ed e' li' che i due loader si infilano. Sotto Proton no: Wine preferisce le
+# proprie builtin e la DLL del mod resta un file inerte — senza un errore, senza
+# una riga di log. Il gioco parte, gli .archive si vedono, e tutto cio' che passa
+# da RED4ext o CET semplicemente non esiste: ArchiveXL, TweakXL e Codeware sono
+# sul disco e sono anche caricati... da nessuno.
+#
+# E' il fallimento peggiore dello stack perche' non somiglia a un fallimento, e
+# perche' guardare i file non lo rivela: la cura e' una variabile d'ambiente, che
+# non sta nell'installazione ma nella configurazione del launcher. Unico pezzo
+# che pakrat non puo' ne' installare ne' verificare guardando il gioco.
+OVERRIDE_KEY = "WINEDLLOVERRIDES"
+OVERRIDE_VALUE = "winmm,version=n,b"
+
+
+def _override_covers(value, dll):
+    """True se WINEDLLOVERRIDES chiede la versione NATIVA di questa DLL.
+
+    Formato: 'a,b=n,b;c=n'. Un gruppo senza '=' (o con la parte destra vuota)
+    DISABILITA le DLL elencate: e' l'esatto contrario di quel che serve, e va
+    trattato come "non coperta", non come "c'e' scritto qualcosa quindi va bene".
+    """
+    for group in (value or "").split(";"):
+        if "=" not in group:
+            continue
+        names, _, modes = group.partition("=")
+        if "n" not in [m.strip().lower() for m in modes.split(",")]:
+            continue
+        for n in names.split(","):
+            n = n.strip().lower()
+            if n.endswith(".dll"):
+                n = n[:-4]
+            if n == dll.lower():
+                return True
+    return False
+
+
+def _heroic_app_name(install):
+    """(cartella config, appName) di Heroic per questa installazione.
+
+    L'appName e' il nome del file in GamesConfig/. Si ricava dallo stesso indice
+    da cui viene il percorso di installazione, quindi l'accoppiamento e' esatto e
+    non per somiglianza di nome.
+    """
+    target = os.path.normpath(install)
+    libs = ("gog_store/installed.json", "store_cache/legendary_library.json",
+            "store/gog_library.json", "store_cache/gog_library.json",
+            "nile_store/library.json", "store/nile_library.json")
+    for h in _heroic_config_dirs():
+        for rel in libs:
+            try:
+                with open(os.path.join(h, rel)) as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            entries = data if isinstance(data, list) else \
+                (data.get("installed") or data.get("library") or data.get("games") or [])
+            if not isinstance(entries, list):
+                continue
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                p = e.get("install_path") or (e.get("install") or {}).get("install_path")
+                app = e.get("appName") or e.get("app_name")
+                if p and app and os.path.normpath(os.path.expanduser(p)) == target:
+                    return h, str(app)
+    return None, None
+
+
+def _env_of(block):
+    """Le variabili d'ambiente di un blocco di configurazione Heroic."""
+    out = {}
+    for kv in (block or {}).get("enviromentOptions") or []:   # il refuso e' di Heroic
+        if isinstance(kv, dict) and kv.get("key"):
+            out[str(kv["key"]).strip()] = str(kv.get("value") or "")
+    return out
+
+
+def _heroic_global_env(h):
+    try:
+        with open(os.path.join(h, "config.json")) as f:
+            return _env_of(json.load(f).get("defaultSettings"))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+
+
+def override_state(install):
+    """Che cosa dice il launcher sui loader nativi.
+
+    'known' distingue "so che manca" da "non ho potuto guardare": su Steam le
+    opzioni di avvio stanno in un file per utente che non leggiamo, e li' e'
+    meglio dire cosa serve che fingere una diagnosi.
+    """
+    st = {"launcher": None, "config": None, "value": "", "known": False,
+          "inherited": False, "missing": []}
+    h, app = _heroic_app_name(install)
+    if app:
+        path = os.path.join(h, "GamesConfig", f"{app}.json")
+        val = ""
+        try:
+            with open(path) as f:
+                val = _env_of((json.load(f) or {}).get(app)).get(OVERRIDE_KEY, "")
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+        if not val:
+            # senza una sua impostazione il gioco eredita quelle globali
+            val = _heroic_global_env(h).get(OVERRIDE_KEY, "")
+            st["inherited"] = bool(val)
+        st.update(launcher="heroic", config=path, value=val, known=True, app=app)
+    elif f"{os.sep}steamapps{os.sep}" in os.path.normpath(install) + os.sep:
+        st["launcher"] = "steam"
+    if st["known"]:
+        st["missing"] = [(name, dll) for name, _rel, dll, _log in LOADERS
+                         if not _override_covers(st["value"], dll)]
+    return st
+
+
+def override_advice(st, install):
+    """Come si mette l'override, detto nei termini del launcher che si usa."""
+    if st["launcher"] == "heroic":
+        return ("In Heroic: Impostazioni del gioco -> Avanzate -> Variabili\n"
+                f"d'ambiente, aggiungi\n\n  {OVERRIDE_KEY}={OVERRIDE_VALUE}\n\n"
+                "winmm e' RED4ext, version e' Cyber Engine Tweaks.")
+    if st["launcher"] == "steam":
+        return ("In Steam: Proprieta' del gioco -> Opzioni di avvio\n\n"
+                f'  {OVERRIDE_KEY}="{OVERRIDE_VALUE}" %command%\n\n'
+                "winmm e' RED4ext, version e' Cyber Engine Tweaks.")
+    return ("Comunque tu lanci il gioco, deve partire con\n\n"
+            f"  {OVERRIDE_KEY}={OVERRIDE_VALUE}\n\n"
+            "winmm e' RED4ext, version e' Cyber Engine Tweaks.")
+
+
+def override_report(st, install, indent=""):
+    """Stampa lo stato degli override. True se c'e' qualcosa da sistemare."""
+    who = {"heroic": "Heroic", "steam": "Steam"}.get(st["launcher"], "launcher")
+    if not st["known"]:
+        print(f"{indent}override delle DLL: non verificabile da qui ({who})")
+        print(f"{indent}  serve comunque: {OVERRIDE_KEY}={OVERRIDE_VALUE}")
+        return False
+    if not st["missing"]:
+        src = " (dalle impostazioni globali)" if st["inherited"] else ""
+        print(f"{indent}override delle DLL ({who}): {st['value']}{src}  ok")
+        return False
+    dove = f" ({who})" if st["value"] else f" ({who}): non impostato"
+    print(f"{indent}override delle DLL{dove}"
+          + (f": {st['value']}" if st["value"] else ""))
+    for name, dll in st["missing"]:
+        print(f"{indent}  ! {dll}.dll non e' forzata nativa -> {name} non si carica")
+    return True
+
+
+def override_check(install, indent=""):
+    """Controllo breve per i comandi che non sono 'doctor'. True se manca."""
+    if not any(os.path.isfile(os.path.join(install, rel.replace("/", os.sep)))
+               for _n, rel, _d, _l in LOADERS):
+        return False            # senza loader la variabile non serve a niente
+    st = override_state(install)
+    if not (st["known"] and st["missing"]):
+        return False
+    print(f"\n{indent}i loader nativi non risultano abilitati sotto Proton:")
+    for name, dll in st["missing"]:
+        print(f"{indent}  {dll}.dll  ->  {name}")
+    print(f"{indent}  senza, i plugin RED4ext (ArchiveXL, TweakXL, Codeware) sono\n"
+          f"{indent}  installati ma non li carica nessuno, e in gioco non succede\n"
+          f"{indent}  niente. Dettagli e rimedio: pakrat cp2077 doctor")
+    return True
+
+
+def _heroic_running():
+    for d in glob.glob("/proc/[0-9]*"):
+        comm, argv0 = _proc_names(d)
+        if comm == "heroic" or argv0 == "heroic":
+            return True
+    return False
+
+
+def offer_override_fix(st, install):
+    """Propone di scrivere l'override nella configurazione di Heroic.
+
+    Si scrive solo a Heroic chiuso: la configurazione la tiene in memoria e la
+    riscrive per conto suo: una modifica fatta mentre e' aperto sparisce senza
+    dire niente, che e' esattamente il tipo di fallimento silenzioso che questo
+    comando esiste per scovare.
+    """
+    if not st["missing"]:
+        return 0
+    print()
+    if st["launcher"] != "heroic" or not st.get("app"):
+        print(override_advice(st, install))
+        return 0
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(override_advice(st, install))
+        return 0
+    print("posso aggiungerla io alla configurazione Heroic di questo gioco:")
+    print(f"  {st['config']}")
+    if _heroic_running():
+        print("\nma Heroic e' aperto, e riscrive quel file per conto suo: la mia\n"
+              "modifica verrebbe persa. Chiudilo e rilancia questo comando,\n"
+              "oppure fallo a mano.\n")
+        print(override_advice(st, install))
+        return 0
+    try:
+        ans = input("  procedo? [s/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    if ans not in ("s", "si", "sì", "y", "yes"):
+        print("  ok, non tocco niente.\n")
+        print(override_advice(st, install))
+        return 0
+    try:
+        with open(st["config"]) as f:
+            data = json.load(f)
+        block = data[st["app"]]
+        env = block.setdefault("enviromentOptions", [])
+        # si AGGIUNGE a quello che c'e' invece di sostituirlo: chi ha gia' un
+        # override ce l'ha messo per un motivo suo. Vale anche per un valore
+        # ereditato dalle impostazioni globali, che scrivendo qui verrebbe
+        # scavalcato in blocco per questo gioco.
+        extra = ";".join(f"{dll}=n,b" for _n, dll in st["missing"])
+        new = f"{st['value']};{extra}" if st["value"] else extra
+        for kv in env:
+            if str(kv.get("key", "")).strip().upper() == OVERRIDE_KEY:
+                kv["value"] = new
+                break
+        else:
+            env.append({"key": OVERRIDE_KEY, "value": new})
+        bak = st["config"] + time.strftime(".bak-%Y%m%d-%H%M%S")
+        shutil.copy2(st["config"], bak)
+        with open(st["config"], "w") as f:
+            json.dump(data, f, indent=2)
+    except (OSError, json.JSONDecodeError, KeyError) as ex:
+        print(f"  non ci sono riuscito: {ex}\n", file=sys.stderr)
+        print(override_advice(st, install))
+        return 1
+    print(f"  fatto: {OVERRIDE_KEY}={new}")
+    print(f"  backup: {os.path.basename(bak)}")
+    print("  rilancia il gioco, poi: pakrat cp2077 doctor")
+    return 0
 
 # Dove i framework scrivono. Si scandiscono le cartelle invece di cercare nomi
 # di file precisi: le convenzioni cambiano fra versioni, l'esistenza di un log
@@ -1767,12 +2026,55 @@ def _scan_logs(install):
     return out
 
 
+# Quanto distanti possono essere due log della stessa partita. I loader scrivono
+# tutti nei primi secondi di avvio; un log piu' vecchio di cosi' viene da una
+# corsa precedente e descrive una configurazione che magari hai gia' cambiato.
+RUN_WINDOW = 300
+
+# redscript ruota il suo log ALL'INIZIO della corsa nuova: redscript_r<data>.log
+# contiene sempre la corsa precedente, per quanto recente sia il suo mtime. E'
+# la trappola per cui si legge un errore risolto e lo si insegue di nuovo.
+_ROTATED_RE = re.compile(r"redscript_r(?!CURRENT)", re.I)
+
+
+def _split_runs(logs):
+    """(log dell'ultima corsa, log delle precedenti), gia' ordinati."""
+    if not logs:
+        return [], []
+    newest = max(t for _r, t, _e in logs)
+    cur, old = [], []
+    for rec in logs:
+        rel, ts, _errs = rec
+        stale = (newest - ts) > RUN_WINDOW or bool(_ROTATED_RE.search(rel.split("/")[-1]))
+        (old if stale else cur).append(rec)
+    if not cur:            # solo log vecchi: sono tutto quello che abbiamo
+        return old, []
+    return cur, old
+
+
+def _last_write(install, reldir):
+    """mtime del log piu' fresco sotto una cartella, o None."""
+    p = os.path.join(install, reldir.replace("/", os.sep))
+    best = None
+    for root, _d, files in os.walk(p):
+        for fn in files:
+            if not fn.lower().endswith(".log"):
+                continue
+            try:
+                ts = os.stat(os.path.join(root, fn)).st_mtime
+            except OSError:
+                continue
+            best = ts if best is None else max(best, ts)
+    return best
+
+
 def cmd_doctor(_args=None):
     """Dopo una partita, dice cosa il gioco ha caricato davvero.
 
     'verify' guarda i file sul disco, che e' un'altra domanda: qui si legge cio'
     che i framework hanno scritto girando dentro il gioco. E' l'unico modo per
-    distinguere "la mod non c'e'" da "la mod c'e' ma non viene caricata".
+    distinguere "la mod non c'e'" da "la mod c'e' ma non viene caricata", che
+    sotto Proton non e' un caso di scuola: e' il modo normale in cui si rompe.
     """
     install = resolve_install_dir()
     if not install:
@@ -1781,37 +2083,80 @@ def cmd_doctor(_args=None):
     mods = scan_mods(ns)
     print(f"installazione: {install}\n")
 
-    print("loader nativi (si sostituiscono a una DLL di sistema):")
-    missing_loader = []
-    for name, rel, dll in LOADERS:
-        here = os.path.isfile(os.path.join(install, rel.replace("/", os.sep)))
-        print(f"  {'X' if here else ' '}  {name:<22} {rel}")
-        if not here:
-            missing_loader.append((name, dll))
     logs = _scan_logs(install)
-    print()
-    if not logs:
-        print("nessun log trovato: il gioco non e' mai partito con queste mod,\n"
-              "oppure i loader non vengono caricati per niente.\n")
-        if not missing_loader:
-            print("I file ci sono tutti, quindi il sospetto e' Proton: le DLL\n"
-                  "sostitutive vanno abilitate esplicitamente. Nelle variabili\n"
-                  "d'ambiente del gioco (Heroic: Impostazioni -> Avanzate):\n\n"
-                  "  WINEDLLOVERRIDES=winmm=n,b;version=n,b\n\n"
-                  "winmm e' RED4ext, version e' Cyber Engine Tweaks.")
+    cur, old = _split_runs(logs)
+    newest = max([t for _r, t, _e in logs] or [0])
+
+    print("loader nativi (si sostituiscono a una DLL di sistema):")
+    missing_loader, silent = [], []
+    for name, rel, dll, logdir in LOADERS:
+        here = os.path.isfile(os.path.join(install, rel.replace("/", os.sep)))
+        wrote = _last_write(install, logdir) if here else None
+        fresh = wrote is not None and (newest - wrote) <= RUN_WINDOW
+        if not here:
+            state = "manca il file"
+            missing_loader.append((name, dll))
+        elif fresh:
+            state = f"caricato {_age(wrote)}"
+        elif wrote:
+            state = f"ultima volta {_age(wrote)}"
         else:
-            print("Mancano anche i loader stessi: pakrat cp2077 bootstrap")
+            state = "MAI CARICATO"
+            silent.append((name, dll))
+        print(f"  {'X' if here else ' '}  {name:<22} {rel:<24} {state}")
+
+    print()
+    st = override_state(install)
+    todo = override_report(st, install)
+
+    # un loader che c'e' ma non ha mai scritto e' il sintomo dell'override
+    # mancante: le due diagnosi si confermano a vicenda, dirle insieme evita di
+    # trattarle come due problemi diversi
+    if silent:
+        chi = ", ".join(n for n, _d in silent)
+        verbo = "non ha mai girato" if len(silent) == 1 else "non hanno mai girato"
+        if st["known"] and st["missing"]:
+            print(f"\n! {chi} {verbo}, e l'override manca: e' quello.")
+        else:
+            print(f"\n! {chi} {verbo} pur essendo installat"
+                  + ("o." if len(silent) == 1 else "i."))
+
+    if missing_loader:
+        print("\nloader non installati: "
+              + ", ".join(n for n, _d in missing_loader)
+              + "\n  pakrat cp2077 bootstrap")
+
+    if not logs:
+        print("\nnessun log trovato: il gioco non e' mai partito con queste mod,\n"
+              "oppure non viene caricato niente del tutto.")
+        if not missing_loader:
+            print()
+            print(override_advice(st, install))
+        if todo:
+            offer_override_fix(st, install)
         return 1
 
-    newest = max(t for _r, t, _e in logs)
-    print(f"log trovati (il piu' recente: {_age(newest)}):\n")
+    print(f"\nlog dell'ultima corsa ({_age(newest)}):\n")
     total_err = 0
     wide = max(len(r) for r, _t, _e in logs)
-    for rel, ts, errs in logs:
+    for rel, ts, errs in cur:
         total_err += len(errs)
         n = len(errs)
         state = ("1 errore" if n == 1 else f"{n} errori") if n else "ok"
         print(f"  {rel:<{wide}} {_age(ts):>12}  {state}")
+
+    old_err = sum(len(e) for _r, _t, e in old)
+    if old:
+        print(f"\ncorse precedenti ({len(old)} log, "
+              + (f"{old_err} righe di errore" if old_err else "nessun errore")
+              + "):\n")
+        for rel, ts, errs in old:
+            n = len(errs)
+            state = ("1 errore" if n == 1 else f"{n} errori") if n else "ok"
+            print(f"  {rel:<{wide}} {_age(ts):>12}  {state}")
+        if old_err and not total_err:
+            print("\n  gli errori stanno solo qui: sono di una configurazione che\n"
+                  "  non e' piu' quella attuale, non inseguirli.")
 
     # un log piu' vecchio dell'ultima modifica alle mod descrive un'altra
     # configurazione: dirlo evita di dare la caccia a un problema gia' risolto
@@ -1823,9 +2168,9 @@ def cmd_doctor(_args=None):
 
     if total_err:
         quanti = "1 riga di errore" if total_err == 1 else f"{total_err} righe di errore"
-        print(f"\n{quanti}:\n")
+        print(f"\n{quanti} nell'ultima corsa:\n")
         shown = 0
-        for rel, _ts, errs in logs:
+        for rel, _ts, errs in cur:
             for line in errs[:3]:
                 print(f"  [{rel.split('/')[-1]}] {line[:110]}")
                 shown += 1
@@ -1834,13 +2179,15 @@ def cmd_doctor(_args=None):
             if shown >= 12:
                 break
     else:
-        print("\nnessun errore nei log: lo stack si carica.")
+        print("\nnessun errore nell'ultima corsa: lo stack si carica.")
 
     red = [m for m in mods if "redmod" in m.kinds and m.enabled]
     if red:
         print(f"\n{len(red)} REDmod attive: se non le vedi in gioco manca il flag "
               "-modded\n  (pakrat cp2077 deploy)")
-    return 0 if not total_err else 1
+    if todo:
+        offer_override_fix(st, install)
+    return 0 if not (total_err or todo) else 1
 
 
 def cmd_deploy(_args=None):
@@ -2342,7 +2689,8 @@ HELP = """pakrat cp2077 - Cyberpunk 2077
                         non la toccano), NOME==latest toglie il pin
                         --dry-run mostra cosa farebbe, --force reinstalla
   deploy                cosa serve per far caricare i REDmod
-  doctor                dopo una partita: cosa il gioco ha caricato davvero
+  doctor                dopo una partita: cosa il gioco ha caricato davvero,
+                        e se Proton carica i loader nativi (WINEDLLOVERRIDES)
   search TERMINE        cerca mod su Nexus per nome (--limit N)
   get ID [ID...]        scarica e installa da Nexus per ID (premium)
                         --file FILE_ID sceglie un file preciso
