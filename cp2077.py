@@ -1979,57 +1979,14 @@ def offer_override_fix(st, install):
     print("  rilancia il gioco, poi: pakrat cp2077 doctor")
     return 0
 
-# Dove i framework scrivono. Si scandiscono le cartelle invece di cercare nomi
-# di file precisi: le convenzioni cambiano fra versioni, l'esistenza di un log
-# fresco no.
+# Dove i framework di QUESTO gioco scrivono. La lettura e la resa a video le fa
+# il core (scan_logs / report_logs), che pero' non puo' sapere ne' dove guardare
+# ne' cosa distingue una corsa dall'altra: quelle due cose gliele diciamo qui.
 LOG_DIRS = [
     "red4ext/logs",
     "r6/logs",
     "bin/x64/plugins/cyber_engine_tweaks",
 ]
-
-_ERR_RE = re.compile(r"\b(error|errore|failed|failure|exception|panic|fatal)\b", re.I)
-
-
-def _age(ts, now=None):
-    d = int((now or time.time()) - ts)
-    if d < 0:
-        return "nel futuro"
-    for lim, div, unit in ((90, 1, "s"), (5400, 60, "min"), (172800, 3600, "ore")):
-        if d < lim:
-            return f"{d // div} {unit} fa"
-    return f"{d // 86400} giorni fa"
-
-
-def _scan_logs(install):
-    """[(percorso_relativo, mtime, righe_di_errore)] dei log trovati."""
-    out = []
-    for d in LOG_DIRS:
-        p = os.path.join(install, d.replace("/", os.sep))
-        if not os.path.isdir(p):
-            continue
-        for root, _dirs, files in os.walk(p):
-            for fn in files:
-                if not fn.lower().endswith(".log"):
-                    continue
-                full = os.path.join(root, fn)
-                rel = os.path.relpath(full, install).replace(os.sep, "/")
-                try:
-                    st = os.stat(full)
-                    with open(full, "r", errors="replace") as fh:
-                        tail = fh.readlines()[-400:]
-                except OSError:
-                    continue
-                errs = [l.strip() for l in tail if _ERR_RE.search(l)]
-                out.append((rel, st.st_mtime, errs))
-    out.sort(key=lambda x: -x[1])
-    return out
-
-
-# Quanto distanti possono essere due log della stessa partita. I loader scrivono
-# tutti nei primi secondi di avvio; un log piu' vecchio di cosi' viene da una
-# corsa precedente e descrive una configurazione che magari hai gia' cambiato.
-RUN_WINDOW = 300
 
 # redscript ruota il suo log ALL'INIZIO della corsa nuova: redscript_r<data>.log
 # contiene sempre la corsa precedente, per quanto recente sia il suo mtime. E'
@@ -2037,19 +1994,16 @@ RUN_WINDOW = 300
 _ROTATED_RE = re.compile(r"redscript_r(?!CURRENT)", re.I)
 
 
-def _split_runs(logs):
-    """(log dell'ultima corsa, log delle precedenti), gia' ordinati."""
-    if not logs:
-        return [], []
-    newest = max(t for _r, t, _e in logs)
-    cur, old = [], []
-    for rec in logs:
-        rel, ts, _errs = rec
-        stale = (newest - ts) > RUN_WINDOW or bool(_ROTATED_RE.search(rel.split("/")[-1]))
-        (old if stale else cur).append(rec)
-    if not cur:            # solo log vecchi: sono tutto quello che abbiamo
-        return old, []
-    return cur, old
+def _rotated(name):
+    return bool(_ROTATED_RE.search(name))
+
+
+def _age(ts, now=None):
+    return core().log_age(ts, now)
+
+
+def _scan_logs(install):
+    return core().scan_logs(install, LOG_DIRS)
 
 
 def _last_write(install, reldir):
@@ -2084,15 +2038,15 @@ def cmd_doctor(_args=None):
     print(f"installazione: {install}\n")
 
     logs = _scan_logs(install)
-    cur, old = _split_runs(logs)
     newest = max([t for _r, t, _e in logs] or [0])
+    window = core().LOG_RUN_WINDOW
 
     print("loader nativi (si sostituiscono a una DLL di sistema):")
     missing_loader, silent = [], []
     for name, rel, dll, logdir in LOADERS:
         here = os.path.isfile(os.path.join(install, rel.replace("/", os.sep)))
         wrote = _last_write(install, logdir) if here else None
-        fresh = wrote is not None and (newest - wrote) <= RUN_WINDOW
+        fresh = wrote is not None and (newest - wrote) <= window
         if not here:
             state = "manca il file"
             missing_loader.append((name, dll))
@@ -2136,27 +2090,8 @@ def cmd_doctor(_args=None):
             offer_override_fix(st, install)
         return 1
 
-    print(f"\nlog dell'ultima corsa ({_age(newest)}):\n")
-    total_err = 0
-    wide = max(len(r) for r, _t, _e in logs)
-    for rel, ts, errs in cur:
-        total_err += len(errs)
-        n = len(errs)
-        state = ("1 errore" if n == 1 else f"{n} errori") if n else "ok"
-        print(f"  {rel:<{wide}} {_age(ts):>12}  {state}")
-
-    old_err = sum(len(e) for _r, _t, e in old)
-    if old:
-        print(f"\ncorse precedenti ({len(old)} log, "
-              + (f"{old_err} righe di errore" if old_err else "nessun errore")
-              + "):\n")
-        for rel, ts, errs in old:
-            n = len(errs)
-            state = ("1 errore" if n == 1 else f"{n} errori") if n else "ok"
-            print(f"  {rel:<{wide}} {_age(ts):>12}  {state}")
-        if old_err and not total_err:
-            print("\n  gli errori stanno solo qui: sono di una configurazione che\n"
-                  "  non e' piu' quella attuale, non inseguirli.")
+    # la resa a video e' del core; qui si sa solo che i log di redscript ruotano
+    total_err, _old_err = core().report_logs(logs, rotated=_rotated)
 
     # un log piu' vecchio dell'ultima modifica alle mod descrive un'altra
     # configurazione: dirlo evita di dare la caccia a un problema gia' risolto
@@ -2166,19 +2101,7 @@ def cmd_doctor(_args=None):
               f"({_age(last_change)}):\n  rilancia il gioco, quello che leggi qui "
               "descrive la configurazione precedente")
 
-    if total_err:
-        quanti = "1 riga di errore" if total_err == 1 else f"{total_err} righe di errore"
-        print(f"\n{quanti} nell'ultima corsa:\n")
-        shown = 0
-        for rel, _ts, errs in cur:
-            for line in errs[:3]:
-                print(f"  [{rel.split('/')[-1]}] {line[:110]}")
-                shown += 1
-                if shown >= 12:
-                    break
-            if shown >= 12:
-                break
-    else:
+    if not total_err:
         print("\nnessun errore nell'ultima corsa: lo stack si carica.")
 
     red = [m for m in mods if "redmod" in m.kinds and m.enabled]

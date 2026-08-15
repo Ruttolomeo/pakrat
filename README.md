@@ -389,6 +389,16 @@ Le cartelle si scandiscono (`red4ext/logs`, `r6/logs`, quella di CET) invece di
 cercare nomi di file precisi: le convenzioni cambiano fra versioni, l'esistenza
 di un log fresco no.
 
+**Cosa e' condiviso e cosa no.** La lettura dei log e la loro resa a video stanno
+nel core (`scan_logs`, `split_runs`, `report_logs`): la tabella, il "quanto fa" e
+la divisione fra ultima corsa e precedenti sono le stesse per qualunque gioco, e
+un `doctor` per un altro titolo parte da li'. Il core pero' non interpreta:
+riceve dal backend le cartelle dove guardare (relative all'installazione o
+assolute, per chi tiene i log nel prefix), la regex di cosa e' un errore e il
+predicato che riconosce un log ruotato. Il significato — quale DLL e' quale mod,
+cosa vuol dire un import irrisolto — resta nel backend, perche' e' l'unica parte
+che non si generalizza senza diventare vaga.
+
 **REDmod**: pakrat prepara `mods/` ma **non lancia `redMod.exe deploy`**, che e' un
 eseguibile Windows — questo tool non dipende da Wine e non e' il caso di iniziare
 qui. Il deploy lo fa REDprelauncher all'avvio, se il gioco parte con `-modded`.

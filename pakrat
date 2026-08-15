@@ -1397,6 +1397,137 @@ def cmd_handler():
     return 0
 
 
+# ----------------------------------------------------------- log dei giochi ---
+# I giochi sono diversi e la diagnosi resta di ciascuno: dove stanno i log, cosa
+# conta come errore e quale mod dovrebbe aver scritto cosa sono conoscenze che
+# non si generalizzano, e provarci vorrebbe dire scrivere un 'doctor' che non sa
+# niente di preciso su nessuno.
+#
+# Quello che si ripete e' la RESA A VIDEO: la tabella, il "quanto fa", e la
+# separazione fra l'ultima corsa e quelle prima. Quest'ultima e' la piu' utile e
+# la meno ovvia — un log di ieri e' indistinguibile da uno di adesso se guardi
+# solo il contenuto, e si finisce a inseguire un errore gia' risolto.
+#
+# Da qui passano i dati, non il significato: la regex degli errori e la regola di
+# rotazione le porta il backend, che e' l'unico a saperle.
+LOG_ERR_PATTERN = r"\b(error|errore|failed|failure|exception|panic|fatal)\b"
+
+# Quanto distanti possono essere due log della stessa partita: i loader scrivono
+# tutti nei primi secondi di avvio.
+LOG_RUN_WINDOW = 300
+
+
+def log_age(ts, now=None):
+    """'3 min fa'. Un'ora esatta non serve a nessuno, l'ordine di grandezza si."""
+    d = int((now or time.time()) - ts)
+    if d < 0:
+        return "nel futuro"
+    for lim, div, unit in ((90, 1, "s"), (5400, 60, "min"), (172800, 3600, "ore")):
+        if d < lim:
+            return f"{d // div} {unit} fa"
+    return f"{d // 86400} giorni fa"
+
+
+def scan_logs(base, dirs, err_re=None, tail=400):
+    """[(percorso relativo a base, mtime, righe d'errore)], dal piu' recente.
+
+    Si scandiscono le CARTELLE invece di cercare nomi di file precisi: le
+    convenzioni cambiano fra versioni di un mod, l'esistenza di un log fresco no.
+    Della coda si tiene solo l'ultimo pezzo: un log di gioco puo' essere enorme e
+    l'inizio racconta comunque un avvio che non e' quello di adesso.
+    """
+    if err_re is None:
+        import re
+        err_re = re.compile(LOG_ERR_PATTERN, re.I)
+    out = []
+    for d in dirs:
+        p = d if os.path.isabs(d) else os.path.join(base, d.replace("/", os.sep))
+        if not os.path.isdir(p):
+            continue
+        for root, _dirs, files in os.walk(p):
+            for fn in files:
+                if not fn.lower().endswith(".log"):
+                    continue
+                full = os.path.join(root, fn)
+                try:
+                    st = os.stat(full)
+                    with open(full, "r", errors="replace") as fh:
+                        lines = fh.readlines()[-tail:]
+                except OSError:
+                    continue
+                rel = os.path.relpath(full, base)
+                if rel.startswith(".."):        # cartella fuori dall'installazione
+                    rel = full
+                out.append((rel.replace(os.sep, "/"), st.st_mtime,
+                            [l.strip() for l in lines if err_re.search(l)]))
+    out.sort(key=lambda x: -x[1])
+    return out
+
+
+def split_runs(logs, window=LOG_RUN_WINDOW, rotated=None):
+    """(log dell'ultima corsa, log delle precedenti).
+
+    'rotated' e' un predicato sul nome del file, e serve perche' l'mtime da solo
+    mente: chi ruota il proprio log all'INIZIO della corsa nuova lascia un file
+    freschissimo che contiene la partita di prima.
+    """
+    if not logs:
+        return [], []
+    newest = max(t for _r, t, _e in logs)
+    cur, old = [], []
+    for rec in logs:
+        rel, ts, _errs = rec
+        stale = (newest - ts) > window or bool(rotated and rotated(rel.split("/")[-1]))
+        (old if stale else cur).append(rec)
+    if not cur:                 # solo log vecchi: sono tutto quello che abbiamo
+        return old, []
+    return cur, old
+
+
+def _err_label(n):
+    return ("1 errore" if n == 1 else f"{n} errori") if n else "ok"
+
+
+def report_logs(logs, window=LOG_RUN_WINDOW, rotated=None, show=12, per_file=3):
+    """Stampa i log divisi per corsa e le prime righe d'errore.
+
+    Ritorna (errori dell'ultima corsa, errori delle precedenti): il giudizio su
+    cosa farne — se sia grave, se spieghi il sintomo — lo da' il chiamante, che
+    e' l'unico a sapere di che gioco si parla.
+    """
+    if not logs:
+        return 0, 0
+    cur, old = split_runs(logs, window, rotated)
+    newest = max(t for _r, t, _e in logs)
+    wide = min(max(len(r) for r, _t, _e in logs), 72)
+    print(f"\nlog dell'ultima corsa ({log_age(newest)}):\n")
+    for rel, ts, errs in cur:
+        print(f"  {rel[-wide:]:<{wide}} {log_age(ts):>12}  {_err_label(len(errs))}")
+    n_cur = sum(len(e) for _r, _t, e in cur)
+    n_old = sum(len(e) for _r, _t, e in old)
+    if old:
+        print(f"\ncorse precedenti ({len(old)} log, "
+              + (f"{n_old} righe di errore" if n_old else "nessun errore") + "):\n")
+        for rel, ts, errs in old:
+            print(f"  {rel[-wide:]:<{wide}} {log_age(ts):>12}  {_err_label(len(errs))}")
+        if n_old and not n_cur:
+            print("\n  gli errori stanno solo qui: sono di una configurazione che\n"
+                  "  non e' piu' quella attuale, non inseguirli.")
+    if n_cur:
+        quanti = "1 riga di errore" if n_cur == 1 else f"{n_cur} righe di errore"
+        print(f"\n{quanti} nell'ultima corsa:\n")
+        shown = 0
+        for rel, _ts, errs in cur:
+            for line in errs[:per_file]:
+                print(f"  [{rel.split('/')[-1]}] {line[:110]}")
+                shown += 1
+                if shown >= show:
+                    break
+            if shown >= show:
+                break
+    return n_cur, n_old
+
+
 # --------------------------------------------------------------------- TUI ---
 HELP = "j/k muovi  J/K riordina  spazio on/off  a aggiungi  d elimina  w salva  r ricarica  q esci"
 
