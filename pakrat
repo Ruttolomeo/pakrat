@@ -12,6 +12,7 @@ Ogni scrittura su un file del gioco e' preceduta da un backup automatico.
 Uso:
   pakrat              scelta del gioco, poi la sua interfaccia
   pakrat list         elenco mod e load order (BG3)
+  pakrat doctor       perche' una mod non si vede in gioco (BG3)
   pakrat add FILE     installa un .pak
   pakrat setup        configura la cartella di gioco
   pakrat backups      elenca i backup di modsettings.lsx
@@ -1397,6 +1398,264 @@ def cmd_handler():
     return 0
 
 
+# --------------------------------------------------------- launcher e Proton ---
+# Questo non e' l'asse "gioco" ma l'asse "launcher": dove Heroic tiene la
+# configurazione, dov'e' il prefix, e se le DLL sostitutive sono abilitate. Non
+# cambia da un titolo all'altro, cambia da Heroic a Steam — e i backend che lo
+# usano (Cyberpunk, BG3, MW5) porterebbero altrimenti tre copie della stessa
+# lettura di JSON.
+#
+# Il pezzo per gioco resta minuscolo: l'elenco dei loader, cioe' quale DLL di
+# sistema si e' preso quale mod.
+OVERRIDE_KEY = "WINEDLLOVERRIDES"
+
+_HEROIC_LIBS = ("gog_store/installed.json", "store_cache/legendary_library.json",
+                "store/gog_library.json", "store_cache/gog_library.json",
+                "nile_store/library.json", "store/nile_library.json")
+
+
+def heroic_config_dirs():
+    for d in ("~/.config/heroic",
+              "~/.var/app/com.heroicgameslauncher.hgl/config/heroic"):
+        p = os.path.expanduser(d)
+        if os.path.isdir(p):
+            yield p
+
+
+def _env_list(block):
+    """Le variabili d'ambiente di un blocco di configurazione Heroic."""
+    out = {}
+    for kv in (block or {}).get("enviromentOptions") or []:   # il refuso e' di Heroic
+        if isinstance(kv, dict) and kv.get("key"):
+            out[str(kv["key"]).strip()] = str(kv.get("value") or "")
+    return out
+
+
+def heroic_global_env(h):
+    try:
+        with open(os.path.join(h, "config.json")) as f:
+            return _env_list(json.load(f).get("defaultSettings"))
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return {}
+
+
+def _heroic_installs():
+    """[(cartella config, appName, percorso di installazione)] noti a Heroic."""
+    out = []
+    for h in heroic_config_dirs():
+        for rel in _HEROIC_LIBS:
+            try:
+                with open(os.path.join(h, rel)) as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            entries = data if isinstance(data, list) else \
+                (data.get("installed") or data.get("library") or data.get("games") or [])
+            if not isinstance(entries, list):
+                continue
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                p = e.get("install_path") or (e.get("install") or {}).get("install_path")
+                app = e.get("appName") or e.get("app_name")
+                if p and app:
+                    out.append((h, str(app),
+                                os.path.normpath(os.path.expanduser(p))))
+    return out
+
+
+def heroic_game(path):
+    """Configurazione Heroic del gioco che sta in 'path', o None.
+
+    'path' puo' essere la cartella di installazione oppure un percorso DENTRO il
+    prefix: BG3 si gestisce dalla sua cartella dati, che nel prefix ci sta e
+    nell'installazione no. L'accoppiamento e' per percorso, non per nome.
+    """
+    target = os.path.normpath(os.path.expanduser(path or ""))
+    if not target:
+        return None
+    best = None
+    for h, app, ip in _heroic_installs():
+        cfgp = os.path.join(h, "GamesConfig", f"{app}.json")
+        block = {}
+        try:
+            with open(cfgp) as f:
+                block = (json.load(f) or {}).get(app) or {}
+        except (OSError, json.JSONDecodeError, AttributeError):
+            pass
+        prefix = os.path.normpath(os.path.expanduser(block.get("winePrefix") or ""))
+        under = lambda base: bool(base) and (target == base
+                                             or target.startswith(base + os.sep))
+        if not (under(ip) or under(prefix)):
+            continue
+        cand = {"launcher": "heroic", "dir": h, "app": app, "config": cfgp,
+                "install": ip, "prefix": prefix, "env": _env_list(block),
+                "global_env": heroic_global_env(h),
+                "wine": (block.get("wineVersion") or {}).get("name") or ""}
+        if best is None or len(ip) > len(best["install"]):
+            best = cand                     # il match piu' specifico vince
+    return best
+
+
+def heroic_running():
+    import glob as _glob
+    for d in _glob.glob("/proc/[0-9]*"):
+        for f in ("comm", "cmdline"):
+            try:
+                with open(os.path.join(d, f), "rb") as fh:
+                    v = fh.read().split(b"\0", 1)[0].decode("utf-8", "replace")
+            except OSError:
+                continue
+            import re as _re
+            if _re.split(r"[\\/]", v.strip())[-1].lower() == "heroic":
+                return True
+    return False
+
+
+def dll_override_covers(value, dll):
+    """True se WINEDLLOVERRIDES chiede la versione NATIVA di questa DLL.
+
+    Formato: 'a,b=n,b;c=n'. Un gruppo senza '=' (o con la parte destra vuota)
+    DISABILITA le DLL elencate: e' l'esatto contrario di quel che serve, e va
+    contato come "non coperta", non come "c'e' scritto qualcosa quindi va bene".
+    """
+    for group in (value or "").split(";"):
+        if "=" not in group:
+            continue
+        names, _, modes = group.partition("=")
+        if "n" not in [m.strip().lower() for m in modes.split(",")]:
+            continue
+        for n in names.split(","):
+            n = n.strip().lower()
+            if n.endswith(".dll"):
+                n = n[:-4]
+            if n == dll.lower():
+                return True
+    return False
+
+
+def override_state(path, loaders):
+    """Cosa dice il launcher sui loader nativi di questo gioco.
+
+    'loaders' e' [(nome del mod, nome della dll)]. 'known' distingue "so che
+    manca" da "non ho potuto guardare": su Steam le opzioni di avvio stanno in un
+    file per utente che non leggiamo, e li' e' meglio dire cosa serve che fingere
+    una diagnosi.
+    """
+    st = {"launcher": None, "config": None, "app": None, "value": "",
+          "known": False, "inherited": False, "missing": [],
+          "loaders": list(loaders), "prefix": "", "install": ""}
+    g = heroic_game(path)
+    if g:
+        val = g["env"].get(OVERRIDE_KEY, "")
+        if not val:
+            val = g["global_env"].get(OVERRIDE_KEY, "")
+            st["inherited"] = bool(val)
+        st.update(launcher="heroic", config=g["config"], app=g["app"], value=val,
+                  known=True, prefix=g["prefix"], install=g["install"])
+    elif f"{os.sep}steamapps{os.sep}" in os.path.normpath(path or "") + os.sep:
+        st["launcher"] = "steam"
+    if st["known"]:
+        st["missing"] = [(n, d) for n, d in loaders
+                         if not dll_override_covers(st["value"], d)]
+    return st
+
+
+def override_advice(st):
+    """Come si mette l'override, detto nei termini del launcher che si usa."""
+    dlls = ",".join(d for _n, d in st["loaders"]) or "winmm"
+    quali = ", ".join(f"{d} e' {n}" for n, d in st["loaders"])
+    if st["launcher"] == "steam":
+        return (f'In Steam: Proprieta\' del gioco -> Opzioni di avvio\n\n'
+                f'  {OVERRIDE_KEY}="{dlls}=n,b" %command%\n\n{quali}.')
+    dove = ("In Heroic: Impostazioni del gioco -> Avanzate -> Variabili\n"
+            "d'ambiente, aggiungi" if st["launcher"] == "heroic"
+            else "Comunque tu lanci il gioco, deve partire con")
+    return f"{dove}\n\n  {OVERRIDE_KEY}={dlls}=n,b\n\n{quali}."
+
+
+def override_report(st, indent=""):
+    """Stampa lo stato degli override. True se c'e' qualcosa da sistemare."""
+    who = {"heroic": "Heroic", "steam": "Steam"}.get(st["launcher"], "launcher")
+    if not st["known"]:
+        dlls = ",".join(d for _n, d in st["loaders"])
+        print(f"{indent}override delle DLL: non verificabile da qui ({who})")
+        print(f"{indent}  serve comunque: {OVERRIDE_KEY}={dlls}=n,b")
+        return False
+    if not st["missing"]:
+        src = " (dalle impostazioni globali)" if st["inherited"] else ""
+        print(f"{indent}override delle DLL ({who}): {st['value']}{src}  ok")
+        return False
+    print(f"{indent}override delle DLL ({who})"
+          + (f": {st['value']}" if st["value"] else ": non impostato"))
+    for name, dll in st["missing"]:
+        print(f"{indent}  ! {dll}.dll non e' forzata nativa -> {name} non si carica")
+    return True
+
+
+def offer_override_fix(st):
+    """Propone di scrivere l'override nella configurazione di Heroic.
+
+    Si scrive solo a Heroic chiuso: la configurazione la tiene in memoria e la
+    riscrive per conto suo, quindi una modifica fatta mentre e' aperto sparisce
+    senza dire niente — che e' proprio il fallimento silenzioso che stiamo
+    cercando di scovare.
+    """
+    if not st["missing"]:
+        return 0
+    print()
+    if st["launcher"] != "heroic" or not st.get("app"):
+        print(override_advice(st))
+        return 0
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print(override_advice(st))
+        return 0
+    print("posso aggiungerla io alla configurazione Heroic di questo gioco:")
+    print(f"  {st['config']}")
+    if heroic_running():
+        print("\nma Heroic e' aperto, e riscrive quel file per conto suo: la mia\n"
+              "modifica verrebbe persa. Chiudilo e rilancia questo comando,\n"
+              "oppure fallo a mano.\n")
+        print(override_advice(st))
+        return 0
+    try:
+        ans = input("  procedo? [s/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    if ans not in ("s", "si", "sì", "y", "yes"):
+        print("  ok, non tocco niente.\n")
+        print(override_advice(st))
+        return 0
+    try:
+        with open(st["config"]) as f:
+            data = json.load(f)
+        env = data[st["app"]].setdefault("enviromentOptions", [])
+        # si AGGIUNGE a quello che c'e' invece di sostituirlo: chi ha gia' un
+        # override ce l'ha messo per un motivo suo. Vale anche per un valore
+        # ereditato dalle globali, che scrivendo qui verrebbe scavalcato in blocco
+        extra = ";".join(f"{dll}=n,b" for _n, dll in st["missing"])
+        new = f"{st['value']};{extra}" if st["value"] else extra
+        for kv in env:
+            if str(kv.get("key", "")).strip().upper() == OVERRIDE_KEY:
+                kv["value"] = new
+                break
+        else:
+            env.append({"key": OVERRIDE_KEY, "value": new})
+        bak = st["config"] + time.strftime(".bak-%Y%m%d-%H%M%S")
+        shutil.copy2(st["config"], bak)
+        with open(st["config"], "w") as f:
+            json.dump(data, f, indent=2)
+    except (OSError, json.JSONDecodeError, KeyError) as ex:
+        print(f"  non ci sono riuscito: {ex}\n", file=sys.stderr)
+        print(override_advice(st))
+        return 1
+    print(f"  fatto: {OVERRIDE_KEY}={new}")
+    print(f"  backup: {os.path.basename(bak)}")
+    print("  rilancia il gioco, poi ricontrolla con 'doctor'")
+    return 0
+
+
 # ----------------------------------------------------------- log dei giochi ---
 # I giochi sono diversi e la diagnosi resta di ciascuno: dove stanno i log, cosa
 # conta come errore e quale mod dovrebbe aver scritto cosa sono conoscenze che
@@ -1689,6 +1948,124 @@ def cmd_list():
             print("  " + e)
 
 
+# ------------------------------------------------------------ doctor (BG3) ---
+# BG3 e' il caso opposto a Cyberpunk: Larian non scrive un log di gioco, quindi
+# qui non c'e' quasi niente da leggere e la diagnosi poggia sullo stato dei file.
+# Le due domande vere sono se Script Extender viene caricato — e' un loader che
+# si sostituisce a DWrite.dll, stessa meccanica di RED4ext, stesso silenzio se
+# Proton non lo carica — e se modsettings.lsx e i .pak sono d'accordo fra loro.
+SE_LOADER = [("Script Extender", "dwrite")]
+SE_APPDATA = os.path.join("drive_c", "users", "steamuser", "AppData", "Local",
+                          "BG3ScriptExtender")
+
+
+def _prefix_root(path):
+    """Risale da un percorso qualsiasi alla radice del prefix (quella con drive_c)."""
+    p = os.path.normpath(path or "")
+    while p and p != os.sep:
+        if os.path.isdir(os.path.join(p, "drive_c")):
+            return p
+        p = os.path.dirname(p)
+    return ""
+
+
+def _se_state(install, prefix):
+    """(dll presente, quando l'updater ha girato, versione piu' recente)."""
+    dll = bool(install) and os.path.isfile(os.path.join(install, "bin", "DWrite.dll"))
+    root = os.path.join(prefix, SE_APPDATA) if prefix else ""
+    ran, ver = None, ""
+    manifest = os.path.join(root, "Manifest-Release.json") if root else ""
+    if manifest and os.path.isfile(manifest):
+        try:
+            ran = os.stat(manifest).st_mtime
+        except OSError:
+            ran = None
+    vdir = os.path.join(root, "ScriptExtender") if root else ""
+    if vdir and os.path.isdir(vdir):
+        vers = sorted({d.split("_")[0] for d in os.listdir(vdir) if "_" in d},
+                      key=lambda v: [int(x) if x.isdigit() else 0
+                                     for x in v.split(".")])
+        ver = vers[-1] if vers else ""
+    return dll, ran, ver
+
+
+def cmd_doctor():
+    """Perche' una mod non si vede in gioco, quando il .pak c'e'.
+
+    'list' mostra l'ordine di caricamento; qui si guarda cosa lo rompe: le voci
+    di modsettings.lsx rimaste senza .pak, e Script Extender, che se non viene
+    caricato porta con se' tutte le mod che dipendono da lui — senza dire niente.
+    """
+    print(f"cartella dati: {LARIAN}")
+    prefix = _prefix_root(LARIAN)
+    g = heroic_game(LARIAN) if prefix else None
+    install = (g or {}).get("install", "")
+    if install:
+        print(f"installazione: {install}"
+              + (f"   ({(g or {}).get('wine') or 'proton'})" if g else ""))
+    elif prefix:
+        print(f"prefix: {prefix}   (installazione non identificata)")
+    print()
+    problems = 0
+
+    dll, ran, ver = _se_state(install, prefix)
+    if not dll and not ran:
+        print("Script Extender: non installato")
+        print("  (normale se nessuna delle tue mod lo richiede)")
+    else:
+        print("Script Extender (bin/DWrite.dll, si sostituisce a una DLL di sistema):")
+        print(f"  {'X' if dll else ' '}  DWrite.dll" + ("" if dll else "  MANCA"))
+        if ran:
+            print(f"  X  ha girato {log_age(ran)}"
+                  + (f", versione {ver}" if ver else ""))
+        else:
+            problems += 1
+            print("     MAI GIRATO: nessuna traccia sua nel prefix")
+            st = override_state(LARIAN, SE_LOADER)
+            print()
+            override_report(st, indent="  ")
+            print("\n  le mod che dipendono da Script Extender non funzioneranno,\n"
+                  "  e non lo dira' nessuno.")
+            if st["missing"]:
+                offer_override_fix(st)
+    print()
+
+    state, errors = build_state()
+    dangling = [m for m in state if m.enabled and not m.is_base and not m.has_pak]
+    off = [m for m in state if not m.enabled and not m.is_base]
+    if dangling:
+        problems += 1
+        quante = ("1 voce attiva" if len(dangling) == 1
+                  else f"{len(dangling)} voci attive")
+        print(f"{quante} in modsettings.lsx senza il .pak:")
+        for m in dangling:
+            print(f"  {m.name[:44]:<44} {m.folder[:24]}")
+        print("  il gioco carica la lista, non trova il modulo e la mod non c'e';\n"
+              "  toglile dall'elenco (pakrat, tasto d) o rimetti il .pak in Mods/\n")
+    if off:
+        print(f"{len(off)} .pak presenti ma non in modsettings.lsx: "
+              + ", ".join(m.name[:24] for m in off[:5]))
+        print("  installate ma spente: se le vuoi in gioco attivale (spazio)\n")
+    if errors:
+        print("avvisi dalla lettura dei .pak:")
+        for e in errors:
+            print("  " + e)
+        print()
+    if not (dangling or off or errors):
+        attive = sum(1 for m in state if m.enabled and not m.is_base)
+        print(f"modsettings.lsx e i .pak sono d'accordo: {attive} mod attive, "
+              "tutte con il loro modulo\n")
+
+    # Larian non scrive un log di gioco: dirlo esplicitamente evita di cercarlo
+    logs = scan_logs(LARIAN, ["Logs", "Story"]) if LARIAN else []
+    if logs:
+        report_logs(logs)
+    else:
+        print("nessun log di gioco: BG3 non ne scrive. Se una mod fa danni,\n"
+              "le tracce sono qui sopra e nei salvataggi, non in un file di log.")
+    return 1 if problems else 0
+
+
 BG3_NOT_FOUND = (
     "Installazione di Baldur's Gate 3 non trovata.\n\n"
     "Ho cercato nei prefix di Steam, Heroic, Lutris, Bottles e in ~/.wine.\n"
@@ -1898,6 +2275,8 @@ def main():
     cmd = args[0]
     if cmd == "list":
         cmd_list()
+    elif cmd == "doctor":
+        return cmd_doctor()
     elif cmd == "add":
         if len(args) < 2:
             print("uso: pakrat add FILE.pak", file=sys.stderr)

@@ -1409,6 +1409,182 @@ def cmd_nxm(url):
     return 0
 
 
+# ------------------------------------------------------------------ doctor ---
+# MW5 e' UE4 shipping: di suo NON scrive il log di gioco. In Saved/Logs c'e' solo
+# cef3.log, che e' il Chromium del menu e non sa niente di mod. Il log vero lo si
+# ottiene solo lanciando con -log, e finche' non lo si fa la diagnosi deve
+# poggiare su altro: i crash dump, che invece ci sono sempre, e il confronto fra
+# quello che c'e' sul disco e quello che il gioco ha scritto in modlist.json.
+SAVED_SUB = os.path.join("drive_c", "users", "steamuser", "AppData", "Local",
+                         "MW5Mercs", "Saved")
+
+# Il formato dei log UE4 e' 'LogCategoria: Livello: testo'. Cercare la parola
+# 'error' e basta qui non funziona: un log UE4 ne contiene centinaia di
+# innocenti, e un doctor che urla ogni volta lo si impara a ignorare.
+_UE4_ERR_RE = re.compile(r":\s*(Error|Fatal)\s*:", re.I)
+
+
+def saved_dir(install=None):
+    """La cartella Saved/ del gioco, che sotto Proton sta dentro il prefix."""
+    install = install or resolve_install_dir()
+    c = core()
+    cands = []
+    g = c.heroic_game(install) if install else None
+    if g and g.get("prefix"):
+        cands.append(os.path.join(g["prefix"], SAVED_SUB))
+    for lib in c._steam_libraries():
+        cands.append(os.path.join(lib, "steamapps", "compatdata", STEAM_APPID,
+                                  "pfx", SAVED_SUB))
+    for p in cands:
+        if os.path.isdir(p):
+            return p
+    return ""
+
+
+def _branch(v):
+    """'1.14.390' -> '1.14'. La serie, che e' quel che conta per compatibilita'."""
+    return ".".join(str(v or "").split(".")[:2])
+
+
+def _blamed(msg, mods):
+    """Mod nominate dentro il messaggio di un crash.
+
+    UE4 nel messaggio ci mette il percorso dell'oggetto che ha fatto saltare
+    tutto, e per una mod quel percorso contiene il nome della sua cartella.
+    Approssimativo, ma quando becca qualcosa e' esattamente quello che cerchi.
+    """
+    hay = re.sub(r"[^a-z0-9]+", "", " ".join(str(msg or "").split()).lower())
+    hits = []
+    for m in mods:
+        key = re.sub(r"[^a-z0-9]+", "", m.folder.lower())
+        if len(key) >= 6 and key in hay:
+            hits.append((key, m.name))
+    # 'YetAnotherWeapon' e' dentro 'YetAnotherWeaponClan': nominarle entrambe
+    # manda a controllare la mod sbagliata, quindi vince il nome piu' lungo
+    return [n for k, n in hits
+            if not any(k != k2 and k in k2 for k2, _n in hits)]
+
+
+def _crash_info(d):
+    """(quando, tipo, messaggio) di un crash dump UE4."""
+    p = os.path.join(d, "CrashContext.runtime-xml")
+    try:
+        ts = os.stat(p).st_mtime
+        txt = open(p, errors="replace").read()
+    except OSError:
+        return None
+    def tag(name):
+        m = re.search(rf"<{name}>(.*?)</{name}>", txt, re.S)
+        return (m.group(1).strip() if m else "")
+    msg = " ".join(tag("ErrorMessage").split())
+    return ts, tag("CrashType") or "?", msg
+
+
+def read_crashes(saved):
+    out = []
+    root = os.path.join(saved, "Crashes")
+    if not os.path.isdir(root):
+        return out
+    for name in os.listdir(root):
+        info = _crash_info(os.path.join(root, name))
+        if info:
+            out.append(info)
+    out.sort(key=lambda x: -x[0])
+    return out
+
+
+def cmd_doctor(_args=None):
+    """Perche' una mod non si vede in gioco, quando sul disco c'e'.
+
+    'list' dice cosa c'e' e com'e' ordinato. Qui si guardano le tre cose che da
+    'list' non si vedono: se il gioco ha davvero visto le mod (modlist.json lo
+    riscrive lui), se sta crashando, e se una mod e' fatta per un'altra versione.
+    """
+    install = resolve_install_dir()
+    if not install:
+        return _no_install()
+    mods = scan_mods(install)
+    ml = read_modlist(install)
+    gv = str(ml.get("gameVersion") or "")
+    status = status_map(install)
+    print(f"installazione: {install}")
+    print(f"versione gioco: {gv or '?'}   mod: {len(mods)}"
+          f"   attive: {sum(1 for m in mods if m.enabled)}\n")
+    problems = 0
+
+    # Una mod per un'altra versione il gioco la carica lo stesso, e poi si
+    # comporta male in modi che non somigliano a un problema di versione.
+    #
+    # Ma il confronto va fatto su major.minor, non sulla stringa intera: in MW5
+    # quasi nessun mod.json e' allineato alla patch corrente (1.14.69 contro
+    # 1.14.390) e sono compatibilissimi. Segnalarli tutti vorrebbe dire segnalare
+    # 12 mod su 13, cioe' non segnalare niente.
+    wrong = [m for m in mods
+             if m.game_version and gv and _branch(m.game_version) != _branch(gv)]
+    patchy = [m for m in mods
+              if m.game_version and gv and m.game_version != gv and m not in wrong]
+    if wrong:
+        problems += 1
+        print(f"{len(wrong)} mod fatte per un'altra versione del gioco:")
+        for m in wrong:
+            print(f"  {'X' if m.enabled else ' '} {m.name[:36]:<36} "
+                  f"per {m.game_version}  (gioco {gv})")
+        print("  il gioco le carica comunque: se crasha o se una mod non fa\n"
+              "  niente, questa e' la prima cosa da sospettare")
+    if patchy:
+        print(f"({len(patchy)} altre dichiarano una patch diversa dentro la stessa\n"
+              f" serie {_branch(gv)}: normale in MW5, non e' un sintomo)")
+    if wrong or patchy:
+        print()
+
+    # il gioco riscrive modlist.json all'uscita: una cartella che non compare li'
+    # non l'ha ancora vista, e restera' spenta finche' non riavvii
+    unseen = [m.folder for m in mods if m.folder not in status]
+    if unseen:
+        print(f"{len(unseen)} cartelle che modlist.json non conosce: "
+              + ", ".join(unseen[:6]))
+        print("  il gioco le registra al prossimo avvio, spente: e' normale se\n"
+              "  le hai appena installate\n")
+    orphans = [k for k in status if not any(m.folder == k for m in mods)]
+    if orphans:
+        problems += 1
+        print(f"{len(orphans)} voci in modlist.json senza cartella: "
+              + ", ".join(orphans[:6]) + "\n  (pakrat mw5 prune)\n")
+
+    saved = saved_dir(install)
+    if not saved:
+        print("cartella Saved/ non trovata: senza quella non posso dire ne' se\n"
+              "il gioco e' partito ne' se ha lasciato crash dump.")
+        return 1 if problems else 0
+    print(f"dati di gioco: {saved}\n")
+
+    crashes = read_crashes(saved)
+    if crashes:
+        problems += 1
+        print(f"{len(crashes)} crash registrati, l'ultimo "
+              f"{core().log_age(crashes[0][0])}:\n")
+        for ts, kind, msg in crashes[:3]:
+            print(f"  [{core().log_age(ts)}] {kind}: {msg[:150]}")
+            blame = _blamed(msg, mods)
+            if blame:
+                print(f"       ^ nomina: {', '.join(blame)}")
+        print()
+    else:
+        print("nessun crash dump.\n")
+
+    logs = core().scan_logs(saved, ["Logs"], err_re=_UE4_ERR_RE)
+    game_log = [l for l in logs if not l[0].lower().endswith("cef3.log")]
+    if not game_log:
+        print("nessun log di gioco: MW5 e' UE4 shipping e non ne scrive, a meno\n"
+              "di lanciarlo con -log. In Heroic: Impostazioni del gioco ->\n"
+              "Argomenti avanzati -> aggiungi\n\n  -log\n\n"
+              "Poi rilancia e ridai questo comando: il log elenca le mod caricate\n"
+              "e quelle rifiutate, che e' l'unica prova diretta.")
+    else:
+        core().report_logs(game_log)
+    return 1 if problems else 0
+
+
 HELP = """pakrat mw5 - MechWarrior 5: Mercenaries
 
   list                  elenco mod, stato e load order
@@ -1426,6 +1602,7 @@ HELP = """pakrat mw5 - MechWarrior 5: Mercenaries
   check                 cerca aggiornamenti su Nexus
   update [MOD]          scarica e installa gli aggiornamenti
   prune                 togli da modlist.json le voci senza cartella
+  doctor                perche' una mod non si vede: versioni, crash, log
   setup [PERCORSO]      mostra o imposta l'installazione di MW5
 
 MOD si indica per indice (da 'list'), nome cartella o nome visualizzato.
@@ -1457,6 +1634,7 @@ def main(args):
         "check": lambda: cmd_check(rest),
         "update": lambda: cmd_update(rest),
         "prune": lambda: cmd_prune(rest),
+        "doctor": lambda: cmd_doctor(rest),
         "setup": lambda: cmd_setup(rest),
         "nxm": lambda: cmd_nxm(rest[0]) if rest else 1,
     }

@@ -1751,143 +1751,27 @@ LOADERS = [
 # non sta nell'installazione ma nella configurazione del launcher. Unico pezzo
 # che pakrat non puo' ne' installare ne' verificare guardando il gioco.
 OVERRIDE_KEY = "WINEDLLOVERRIDES"
-OVERRIDE_VALUE = "winmm,version=n,b"
 
-
-def _override_covers(value, dll):
-    """True se WINEDLLOVERRIDES chiede la versione NATIVA di questa DLL.
-
-    Formato: 'a,b=n,b;c=n'. Un gruppo senza '=' (o con la parte destra vuota)
-    DISABILITA le DLL elencate: e' l'esatto contrario di quel che serve, e va
-    trattato come "non coperta", non come "c'e' scritto qualcosa quindi va bene".
-    """
-    for group in (value or "").split(";"):
-        if "=" not in group:
-            continue
-        names, _, modes = group.partition("=")
-        if "n" not in [m.strip().lower() for m in modes.split(",")]:
-            continue
-        for n in names.split(","):
-            n = n.strip().lower()
-            if n.endswith(".dll"):
-                n = n[:-4]
-            if n == dll.lower():
-                return True
-    return False
-
-
-def _heroic_app_name(install):
-    """(cartella config, appName) di Heroic per questa installazione.
-
-    L'appName e' il nome del file in GamesConfig/. Si ricava dallo stesso indice
-    da cui viene il percorso di installazione, quindi l'accoppiamento e' esatto e
-    non per somiglianza di nome.
-    """
-    target = os.path.normpath(install)
-    libs = ("gog_store/installed.json", "store_cache/legendary_library.json",
-            "store/gog_library.json", "store_cache/gog_library.json",
-            "nile_store/library.json", "store/nile_library.json")
-    for h in _heroic_config_dirs():
-        for rel in libs:
-            try:
-                with open(os.path.join(h, rel)) as f:
-                    data = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                continue
-            entries = data if isinstance(data, list) else \
-                (data.get("installed") or data.get("library") or data.get("games") or [])
-            if not isinstance(entries, list):
-                continue
-            for e in entries:
-                if not isinstance(e, dict):
-                    continue
-                p = e.get("install_path") or (e.get("install") or {}).get("install_path")
-                app = e.get("appName") or e.get("app_name")
-                if p and app and os.path.normpath(os.path.expanduser(p)) == target:
-                    return h, str(app)
-    return None, None
-
-
-def _env_of(block):
-    """Le variabili d'ambiente di un blocco di configurazione Heroic."""
-    out = {}
-    for kv in (block or {}).get("enviromentOptions") or []:   # il refuso e' di Heroic
-        if isinstance(kv, dict) and kv.get("key"):
-            out[str(kv["key"]).strip()] = str(kv.get("value") or "")
-    return out
-
-
-def _heroic_global_env(h):
-    try:
-        with open(os.path.join(h, "config.json")) as f:
-            return _env_of(json.load(f).get("defaultSettings"))
-    except (OSError, json.JSONDecodeError, AttributeError):
-        return {}
+# I due loader nativi di questo gioco, nella forma che vuole il core:
+# (nome del mod, DLL di sistema che si prende).
+OVERRIDE_LOADERS = [(n, d) for n, _rel, d, _log in LOADERS]
 
 
 def override_state(install):
-    """Che cosa dice il launcher sui loader nativi.
-
-    'known' distingue "so che manca" da "non ho potuto guardare": su Steam le
-    opzioni di avvio stanno in un file per utente che non leggiamo, e li' e'
-    meglio dire cosa serve che fingere una diagnosi.
-    """
-    st = {"launcher": None, "config": None, "value": "", "known": False,
-          "inherited": False, "missing": []}
-    h, app = _heroic_app_name(install)
-    if app:
-        path = os.path.join(h, "GamesConfig", f"{app}.json")
-        val = ""
-        try:
-            with open(path) as f:
-                val = _env_of((json.load(f) or {}).get(app)).get(OVERRIDE_KEY, "")
-        except (OSError, json.JSONDecodeError, AttributeError):
-            pass
-        if not val:
-            # senza una sua impostazione il gioco eredita quelle globali
-            val = _heroic_global_env(h).get(OVERRIDE_KEY, "")
-            st["inherited"] = bool(val)
-        st.update(launcher="heroic", config=path, value=val, known=True, app=app)
-    elif f"{os.sep}steamapps{os.sep}" in os.path.normpath(install) + os.sep:
-        st["launcher"] = "steam"
-    if st["known"]:
-        st["missing"] = [(name, dll) for name, _rel, dll, _log in LOADERS
-                         if not _override_covers(st["value"], dll)]
-    return st
+    return core().override_state(install, OVERRIDE_LOADERS)
 
 
-def override_advice(st, install):
-    """Come si mette l'override, detto nei termini del launcher che si usa."""
-    if st["launcher"] == "heroic":
-        return ("In Heroic: Impostazioni del gioco -> Avanzate -> Variabili\n"
-                f"d'ambiente, aggiungi\n\n  {OVERRIDE_KEY}={OVERRIDE_VALUE}\n\n"
-                "winmm e' RED4ext, version e' Cyber Engine Tweaks.")
-    if st["launcher"] == "steam":
-        return ("In Steam: Proprieta' del gioco -> Opzioni di avvio\n\n"
-                f'  {OVERRIDE_KEY}="{OVERRIDE_VALUE}" %command%\n\n'
-                "winmm e' RED4ext, version e' Cyber Engine Tweaks.")
-    return ("Comunque tu lanci il gioco, deve partire con\n\n"
-            f"  {OVERRIDE_KEY}={OVERRIDE_VALUE}\n\n"
-            "winmm e' RED4ext, version e' Cyber Engine Tweaks.")
+def override_advice(st, _install=None):
+    return core().override_advice(st)
 
 
-def override_report(st, install, indent=""):
-    """Stampa lo stato degli override. True se c'e' qualcosa da sistemare."""
-    who = {"heroic": "Heroic", "steam": "Steam"}.get(st["launcher"], "launcher")
-    if not st["known"]:
-        print(f"{indent}override delle DLL: non verificabile da qui ({who})")
-        print(f"{indent}  serve comunque: {OVERRIDE_KEY}={OVERRIDE_VALUE}")
-        return False
-    if not st["missing"]:
-        src = " (dalle impostazioni globali)" if st["inherited"] else ""
-        print(f"{indent}override delle DLL ({who}): {st['value']}{src}  ok")
-        return False
-    dove = f" ({who})" if st["value"] else f" ({who}): non impostato"
-    print(f"{indent}override delle DLL{dove}"
-          + (f": {st['value']}" if st["value"] else ""))
-    for name, dll in st["missing"]:
-        print(f"{indent}  ! {dll}.dll non e' forzata nativa -> {name} non si carica")
-    return True
+def override_report(st, _install=None, indent=""):
+    return core().override_report(st, indent)
+
+
+def offer_override_fix(st, _install=None):
+    rc = core().offer_override_fix(st)
+    return rc
 
 
 def override_check(install, indent=""):
@@ -1906,78 +1790,6 @@ def override_check(install, indent=""):
           f"{indent}  niente. Dettagli e rimedio: pakrat cp2077 doctor")
     return True
 
-
-def _heroic_running():
-    for d in glob.glob("/proc/[0-9]*"):
-        comm, argv0 = _proc_names(d)
-        if comm == "heroic" or argv0 == "heroic":
-            return True
-    return False
-
-
-def offer_override_fix(st, install):
-    """Propone di scrivere l'override nella configurazione di Heroic.
-
-    Si scrive solo a Heroic chiuso: la configurazione la tiene in memoria e la
-    riscrive per conto suo: una modifica fatta mentre e' aperto sparisce senza
-    dire niente, che e' esattamente il tipo di fallimento silenzioso che questo
-    comando esiste per scovare.
-    """
-    if not st["missing"]:
-        return 0
-    print()
-    if st["launcher"] != "heroic" or not st.get("app"):
-        print(override_advice(st, install))
-        return 0
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        print(override_advice(st, install))
-        return 0
-    print("posso aggiungerla io alla configurazione Heroic di questo gioco:")
-    print(f"  {st['config']}")
-    if _heroic_running():
-        print("\nma Heroic e' aperto, e riscrive quel file per conto suo: la mia\n"
-              "modifica verrebbe persa. Chiudilo e rilancia questo comando,\n"
-              "oppure fallo a mano.\n")
-        print(override_advice(st, install))
-        return 0
-    try:
-        ans = input("  procedo? [s/N]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return 0
-    if ans not in ("s", "si", "sì", "y", "yes"):
-        print("  ok, non tocco niente.\n")
-        print(override_advice(st, install))
-        return 0
-    try:
-        with open(st["config"]) as f:
-            data = json.load(f)
-        block = data[st["app"]]
-        env = block.setdefault("enviromentOptions", [])
-        # si AGGIUNGE a quello che c'e' invece di sostituirlo: chi ha gia' un
-        # override ce l'ha messo per un motivo suo. Vale anche per un valore
-        # ereditato dalle impostazioni globali, che scrivendo qui verrebbe
-        # scavalcato in blocco per questo gioco.
-        extra = ";".join(f"{dll}=n,b" for _n, dll in st["missing"])
-        new = f"{st['value']};{extra}" if st["value"] else extra
-        for kv in env:
-            if str(kv.get("key", "")).strip().upper() == OVERRIDE_KEY:
-                kv["value"] = new
-                break
-        else:
-            env.append({"key": OVERRIDE_KEY, "value": new})
-        bak = st["config"] + time.strftime(".bak-%Y%m%d-%H%M%S")
-        shutil.copy2(st["config"], bak)
-        with open(st["config"], "w") as f:
-            json.dump(data, f, indent=2)
-    except (OSError, json.JSONDecodeError, KeyError) as ex:
-        print(f"  non ci sono riuscito: {ex}\n", file=sys.stderr)
-        print(override_advice(st, install))
-        return 1
-    print(f"  fatto: {OVERRIDE_KEY}={new}")
-    print(f"  backup: {os.path.basename(bak)}")
-    print("  rilancia il gioco, poi: pakrat cp2077 doctor")
-    return 0
 
 # Dove i framework di QUESTO gioco scrivono. La lettura e la resa a video le fa
 # il core (scan_logs / report_logs), che pero' non puo' sapere ne' dove guardare

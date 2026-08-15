@@ -57,6 +57,7 @@ Il core (`pakrat`) non dipende da Qt: la GUI e' un frontend sostituibile.
 pakrat                      menu di scelta del gioco
 pakrat setup                wizard: sceglie la cartella di gioco
 pakrat list                 elenco mod e load order
+pakrat doctor               perche' una mod non si vede in gioco
 pakrat add FILE.pak         installa un .pak
 pakrat apikey CHIAVE        salva la Personal API Key di Nexus
 pakrat match [N]            cerca su Nexus e associa (scelta interattiva)
@@ -90,6 +91,7 @@ pakrat mw5 link MOD ID      associa una mod alla sua pagina Nexus
 pakrat mw5 check            cerca aggiornamenti
 pakrat mw5 update [MOD]     scarica e installa gli aggiornamenti
 pakrat mw5 prune            togli da modlist.json le voci senza cartella
+pakrat mw5 doctor           perche' una mod non si vede: versioni, crash, log
 pakrat mw5 setup [PERCORSO] mostra o imposta l'installazione
 ```
 
@@ -398,6 +400,38 @@ assolute, per chi tiene i log nel prefix), la regex di cosa e' un errore e il
 predicato che riconosce un log ruotato. Il significato — quale DLL e' quale mod,
 cosa vuol dire un import irrisolto — resta nel backend, perche' e' l'unica parte
 che non si generalizza senza diventare vaga.
+
+### Lo stesso per gli altri due giochi
+
+`doctor` esiste anche per BG3 (`pakrat doctor`) e MW5 (`pakrat mw5 doctor`), ma
+guarda cose diverse, perche' diversi sono i giochi. In comune c'e' solo la resa a
+video, e per BG3 e MW5 quasi non serve: **nessuno dei due scrive un log di gioco**.
+Larian non ne scrive affatto; MW5 e' UE4 shipping e in `Saved/Logs` lascia solo il
+`cef3.log` del Chromium dei menu, a meno di lanciarlo con `-log` — cosa che
+`doctor` dice, con l'argomento da aggiungere in Heroic.
+
+Quindi le domande cambiano.
+
+**BG3** — la stessa meccanica di Cyberpunk sta in Script Extender, che si installa
+come `bin/DWrite.dll` e si sostituisce a una DLL di sistema esattamente come
+RED4ext: se Proton non lo carica, le mod che dipendono da lui non fanno niente e
+non protesta nessuno. Che sia stato caricato lo si vede dal suo aggiornatore, che
+scrive nel prefix (`AppData/Local/BG3ScriptExtender`); se non l'ha mai fatto,
+`doctor` passa al controllo degli override — lo stesso di Cyberpunk, con `dwrite`
+al posto di `winmm`. Poi confronta `modsettings.lsx` con i `.pak` presenti: una
+voce attiva rimasta senza il suo modulo e' il modo classico in cui una mod
+"installata" non c'e'.
+
+**MW5** — niente loader nativi, quindi niente override. Le domande sono altre: se
+una mod dichiara una versione del gioco diversa da quella corrente (confrontata
+per **serie**, `1.14` contro `1.13`, non per patch: in MW5 quasi nessun `mod.json`
+e' allineato alla patch e segnalarle tutte vorrebbe dire segnalare 12 mod su 13),
+se `modlist.json` conosce le cartelle che ci sono davvero, e soprattutto i **crash
+dump**, che UE4 lascia sempre in `Saved/Crashes`. Di ognuno si legge tipo e
+messaggio, e si guarda se il messaggio nomina una mod — UE4 nel testo dell'errore
+mette il percorso dell'oggetto che ha fatto saltare tutto, e per una mod quel
+percorso contiene il nome della sua cartella. E' un'euristica, ma quando becca
+qualcosa e' esattamente quello che stavi cercando.
 
 **REDmod**: pakrat prepara `mods/` ma **non lancia `redMod.exe deploy`**, che e' un
 eseguibile Windows — questo tool non dipende da Wine e non e' il caso di iniziare
