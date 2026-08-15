@@ -147,6 +147,7 @@ pakrat cp2077 bootstrap     scarica e installa i core mod mancanti, in ordine
                             --dry-run mostra cosa farebbe, --force reinstalla
 pakrat cp2077 deploy        cosa serve per far caricare i REDmod
 pakrat cp2077 search TERM   cerca mod su Nexus per nome (--limit N)
+pakrat cp2077 get ID        scarica e installa da Nexus per ID (premium)
 pakrat cp2077 link MOD ID   associa una mod alla sua pagina Nexus
 pakrat cp2077 check         cerca aggiornamenti
 pakrat cp2077 update [MOD]  scarica e installa gli aggiornamenti
@@ -230,8 +231,19 @@ pakrat fa e' cercare anche le singole parole quando la frase intera non da'
 risultati, e riordinare per somiglianza cio' che torna, cosi' il risultato piu'
 pertinente sta in cima invece che in mezzo.
 
-Il download non passa da qui: si prende dalla pagina (o col pulsante "Mod Manager
-Download", che pakrat gestisce via `nxm://`) e poi `add` piu' `link`.
+Trovato l'ID, `pakrat cp2077 get 6945` scarica e installa in un colpo solo, e
+registra da se' l'associazione a Nexus — quindi `check` e `update` funzionano
+subito, senza passare da `link`. Serve un account **premium**: l'API i link di
+download diretti li da' solo a quelli, e senza si ricade sulla pagina del sito
+(o sul pulsante "Mod Manager Download", che pakrat gestisce via `nxm://`).
+`--file FILE_ID` sceglie un file preciso invece del principale, per le mod che
+ne offrono diverse varianti.
+
+**L'ID Nexus vale anche per indicare una mod gia' installata**: `remove 6945`,
+`disable 6945`, `order 6945 10`. Un numero e' prima di tutto l'indice della
+lista, che e' quello che si ha sotto gli occhi; se non esiste un indice cosi', si
+prova come ID Nexus, che e' sempre molto piu' grande. Nel dubbio, `id:6945` e'
+esplicito.
 
 ### Prerequisiti (core mod)
 

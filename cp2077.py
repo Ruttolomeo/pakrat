@@ -514,13 +514,25 @@ def scan_mods(ns=None):
 
 
 def find_mod(ref, mods=None, ns=None):
-    """Trova una mod per indice (da 'list'), slug o nome visualizzato."""
+    """Trova una mod per indice (da 'list'), ID Nexus, slug o nome visualizzato.
+
+    Un numero e' prima di tutto l'indice della lista, che e' quello che si ha
+    sotto gli occhi; se non esiste un indice cosi' si prova come ID Nexus, che e'
+    sempre molto piu' grande. Per togliere ogni dubbio c'e' la forma 'id:6945'.
+    """
     if mods is None:
         mods = scan_mods(ns)
     ref = str(ref).strip()
+    if ref.lower().startswith("id:") and ref[3:].strip().isdigit():
+        want = int(ref[3:].strip())
+        by_id = [m for m in mods if m.nexus_id and int(m.nexus_id) == want]
+        return by_id[0] if by_id else None
     if ref.isdigit():
         i = int(ref)
-        return mods[i - 1] if 1 <= i <= len(mods) else None
+        if 1 <= i <= len(mods):
+            return mods[i - 1]
+        by_id = [m for m in mods if m.nexus_id and int(m.nexus_id) == i]
+        return by_id[0] if by_id else None
     low = ref.lower()
     exact = [m for m in mods if m.slug.lower() == low or m.name.lower() == low]
     if len(exact) == 1:
@@ -1825,6 +1837,118 @@ def cmd_search(args):
     return 0
 
 
+def cmd_get(args):
+    """Scarica e installa una mod dal suo ID Nexus: il passo dopo 'search'."""
+    refs = [a for a in args if not a.startswith("-")]
+    if not refs:
+        print("uso: pakrat cp2077 get ID [ID...] [--file FILE_ID] [--no-enable]",
+              file=sys.stderr)
+        return 1
+    file_id = None
+    if "--file" in args:
+        i = args.index("--file")
+        if i + 1 < len(args) and args[i + 1].isdigit():
+            file_id = int(args[i + 1])
+            refs = [r for r in refs if r != args[i + 1]]
+    enable = "--no-enable" not in args
+    install = resolve_install_dir()
+    if not install:
+        return _no_install()
+    c = core()
+    api_key = c.load_config().get("nexus_api_key")
+    if not api_key:
+        print("API key non configurata: pakrat apikey LA_TUA_CHIAVE", file=sys.stderr)
+        return 1
+    if not require_game_closed():
+        return 1
+    rc, done = 0, []
+    for ref in refs:
+        mod_id = parse_ref(ref)
+        if not mod_id:
+            print(f"non e' un ID o un URL di mod: {ref}", file=sys.stderr)
+            rc = 1
+            continue
+        try:
+            info = nexus_get(f"/mods/{mod_id}.json", api_key)
+            files = nexus_get(f"/mods/{mod_id}/files.json", api_key).get("files", [])
+        except Exception as ex:
+            print(f"{mod_id}: {ex}", file=sys.stderr)
+            rc = 1
+            continue
+        name = str(info.get("name") or mod_id)
+        print(f"{name} (v{info.get('version') or '?'}) — {info.get('author') or ''}")
+        if file_id:
+            f = next((x for x in files if int(x["file_id"]) == file_id), None)
+            if f is None:
+                print(f"  file_id {file_id} non trovato fra i file di questa mod",
+                      file=sys.stderr)
+                rc = 1
+                continue
+        else:
+            f = c.pick_main_file(files)
+        if f is None:
+            print("  nessun file scaricabile", file=sys.stderr)
+            rc = 1
+            continue
+        # senza premium l'API non da' link diretti: si passa dal browser, ed e'
+        # esattamente cio' che fa il pulsante "Mod Manager Download"
+        if not c.is_premium(api_key):
+            print("  serve il download dal sito (account non premium):")
+            print("  " + mod_page_url(mod_id, f["file_id"]))
+            rc = 1
+            continue
+        try:
+            links = nexus_get(
+                f"/mods/{mod_id}/files/{f['file_id']}/download_link.json", api_key)
+        except Exception as ex:
+            print(f"  link non ottenibile: {ex}", file=sys.stderr)
+            rc = 1
+            continue
+        if not links:
+            print("  nessun link: " + mod_page_url(mod_id, f["file_id"]),
+                  file=sys.stderr)
+            rc = 1
+            continue
+        cache = os.path.join(c.CONFIG_DIR, "cache")
+        os.makedirs(cache, exist_ok=True)
+        archive = os.path.join(cache, f["file_name"])
+        if not os.path.isfile(archive):
+            print(f"  scarico {f['file_name']} "
+                  f"({f.get('size_kb', 0)/1024:.1f} MB)")
+            try:
+                c.download_url(links[0]["URI"], archive)
+            except Exception as ex:
+                print(f"  download fallito: {ex}", file=sys.stderr)
+                rc = 1
+                continue
+        try:
+            slug = install_archive(archive, install, enable=enable,
+                                   log=lambda s: print("  " + s.lstrip()))
+        except Exception as ex:
+            print(f"  errore: {ex}", file=sys.stderr)
+            rc = 1
+            continue
+        if not slug:
+            rc = 1
+            continue
+        # arrivando da Nexus l'associazione la sappiamo gia': registrarla qui
+        # evita il 'link' a mano e fa funzionare 'check' da subito
+        cfg, ns = cfg_load()
+        link_slug(slug, mod_id, ns, file_id=f["file_id"],
+                  version=str(info.get("version") or ""))
+        cfg_save(cfg)
+        done.append(slug)
+    if done:
+        print(f"\nfatto. Controlla con: pakrat cp2077 list")
+        _cfg, ns = cfg_load()
+        need = sorted({fw for s in done
+                       for fw in missing_frameworks(
+                           (ns.get("mods") or {}).get(s, {}).get("files") or [],
+                           install)})
+        offer_bootstrap(need, install)
+    return rc
+
+
 def cmd_link(args):
     if len(args) < 2:
         print("uso: pakrat cp2077 link MOD ID|URL", file=sys.stderr)
@@ -2088,12 +2212,15 @@ HELP = """pakrat cp2077 - Cyberpunk 2077
                         --dry-run mostra cosa farebbe, --force reinstalla
   deploy                cosa serve per far caricare i REDmod
   search TERMINE        cerca mod su Nexus per nome (--limit N)
+  get ID [ID...]        scarica e installa da Nexus per ID (premium)
+                        --file FILE_ID sceglie un file preciso
   link MOD ID           associa una mod alla sua pagina Nexus
   check                 cerca aggiornamenti su Nexus
   update [MOD]          scarica e installa gli aggiornamenti
   setup [PERCORSO]      mostra o imposta l'installazione
 
-MOD si indica per indice (da 'list'), slug o nome visualizzato.
+MOD si indica per indice (da 'list'), ID Nexus, slug o nome visualizzato.
+Un numero e' prima l'indice, poi l'ID Nexus; 'id:6945' toglie il dubbio.
 
 Qui una mod e' un insieme di file sparsi sulla radice del gioco, non una
 cartella: pakrat tiene il manifest di cosa ha installato e lavora su quello.
@@ -2122,6 +2249,8 @@ def main(args):
         "verify": lambda: cmd_verify(rest),
         "deps": lambda: cmd_deps(rest),
         "search": lambda: cmd_search(rest),
+        "get": lambda: cmd_get(rest),
+        "install": lambda: cmd_get(rest),
         "bootstrap": lambda: cmd_bootstrap(rest),
         "core": lambda: cmd_bootstrap(rest),
         "deploy": lambda: cmd_deploy(rest),
