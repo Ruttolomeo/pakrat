@@ -41,14 +41,20 @@ Un unico core, tre modi per usarlo:
 | Comando | Cosa fa |
 |---|---|
 | `pakrat-gui` | GUI Qt6 (PySide6), anche dal menu di Plasma come "BG3 Mods" |
-| `pakrat` | TUI curses |
+| `pakrat` | menu: sceglie il gioco, poi ne apre l'interfaccia |
 | `pakrat <comando>` | CLI, vedi sotto |
+
+`pakrat` senza argomenti chiede quale gioco gestire, mostrando per ciascuno se e'
+stato trovato e quante mod ha. Scegliendo BG3 si apre la TUI curses; MechWarrior 5
+e Cyberpunk una TUI non ce l'hanno, quindi stampano l'elenco delle mod e i comandi
+disponibili. I comandi diretti restano quelli di sempre, `pakrat list` compreso.
 
 Il core (`pakrat`) non dipende da Qt: la GUI e' un frontend sostituibile.
 
 ## Comandi
 
 ```
+pakrat                      menu di scelta del gioco
 pakrat setup                wizard: sceglie la cartella di gioco
 pakrat list                 elenco mod e load order
 pakrat add FILE.pak         installa un .pak

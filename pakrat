@@ -10,8 +10,8 @@ sparsi sulla radice del gioco, non una cartella sola).
 Ogni scrittura su un file del gioco e' preceduta da un backup automatico.
 
 Uso:
-  pakrat              TUI interattiva
-  pakrat list         elenco mod e load order
+  pakrat              scelta del gioco, poi la sua interfaccia
+  pakrat list         elenco mod e load order (BG3)
   pakrat add FILE     installa un .pak
   pakrat setup        configura la cartella di gioco
   pakrat backups      elenca i backup di modsettings.lsx
@@ -1556,6 +1556,117 @@ def cmd_list():
             print("  " + e)
 
 
+BG3_NOT_FOUND = (
+    "Installazione di Baldur's Gate 3 non trovata.\n\n"
+    "Ho cercato nei prefix di Steam, Heroic, Lutris, Bottles e in ~/.wine.\n"
+    "Se BG3 e' altrove, indica la cartella dati di Larian in uno dei due modi:\n\n"
+    "  - variabile d'ambiente PAKRAT_LARIAN\n"
+    f"  - chiave \"larian_dir\" in {os.path.join(CONFIG_DIR, 'config.json')}\n\n"
+    "Deve puntare alla cartella che contiene Mods/ e PlayerProfiles/,\n"
+    "tipicamente .../AppData/Local/Larian Studios/Baldur's Gate 3\n\n"
+    "Oppure lancia:  pakrat setup")
+
+
+def _count(total, on):
+    if not total:
+        return "installato, nessuna mod"
+    return f"{total} mod, {on} attive"
+
+
+def _bg3_status():
+    """(configurato, riassunto) di BG3, senza far esplodere niente se manca."""
+    if not LARIAN or not os.path.isdir(LARIAN):
+        return False, "non trovato"
+    try:
+        state, _err = build_state()
+        mods = [m for m in state if not m.is_base]     # GustavX non e' una mod
+        on = sum(1 for m in mods if m.enabled)
+        return True, _count(len(mods), on)
+    except Exception:
+        return True, "installato"
+
+
+def _backend_status(name):
+    """(configurato, riassunto) di un backend, caricandolo solo per chiedere."""
+    be = load_backend(name)
+    if be is None:
+        return False, f"backend assente ({BACKENDS[name][0]})"
+    try:
+        install = be.resolve_install_dir()
+        if not install:
+            return False, "installazione non trovata"
+        mods = be.scan_mods()
+        on = sum(1 for m in mods if getattr(m, "enabled", True))
+        return True, _count(len(mods), on)
+    except Exception:
+        return False, "non configurato"
+
+
+# Il menu iniziale. L'ordine e' quello in cui i giochi sono arrivati nel tool.
+GAMES = [
+    ("bg3",    "Baldur's Gate 3"),
+    ("mw5",    "MechWarrior 5: Mercenaries"),
+    ("cp2077", "Cyberpunk 2077"),
+]
+
+
+def game_menu():
+    """Chiede quale gioco gestire, poi entra nella sua interfaccia.
+
+    Prima di questo menu 'pakrat' nudo apriva la TUI di BG3, e se BG3 non c'era
+    si limitava a un errore: un tool che gestisce tre giochi non puo' rifiutarsi
+    di partire perche' ne manca uno.
+    """
+    rows = []
+    for key, label in GAMES:
+        ok, note = (_bg3_status() if key == "bg3" else _backend_status(key))
+        rows.append((key, label, ok, note))
+
+    print("pakrat — gestore mod\n")
+    for i, (_k, label, ok, note) in enumerate(rows, 1):
+        mark = " " if ok else "!"
+        print(f"  {i}  {mark} {label:<28} {note}")
+    print("\n  q  esci\n")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("(non sei su un terminale interattivo: usa 'pakrat help')")
+        return 0
+    try:
+        ans = input("gioco: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    if ans in ("q", "quit", "esci", ""):
+        return 0
+    key = None
+    if ans.isdigit() and 1 <= int(ans) <= len(rows):
+        key = rows[int(ans) - 1][0]
+    else:
+        for k, label, _ok, _n in rows:
+            if ans == k or ans in label.lower():
+                key = k
+                break
+    if key is None:
+        print(f"scelta non valida: {ans}", file=sys.stderr)
+        return 1
+    print()
+    if key == "bg3":
+        if not LARIAN or not os.path.isdir(LARIAN):
+            print(BG3_NOT_FOUND, file=sys.stderr)
+            return 1
+        curses.wrapper(tui)
+        return 0
+    # MW5 e Cyberpunk non hanno una TUI: la cosa piu' utile e' l'elenco delle
+    # mod piu' i comandi disponibili, cosi' il passo successivo e' li' pronto.
+    be = load_backend(key)
+    if be is None:
+        print(f"backend {key} non installato", file=sys.stderr)
+        return 1
+    rc = be.main(["list"])
+    print()
+    be.main(["help"])
+    return rc
+
+
 def cmd_setup():
     """Wizard: sceglie la cartella dati di BG3 fra quelle trovate o a mano."""
     print("Configurazione di pakrat\n")
@@ -1644,20 +1755,13 @@ def main():
         if backend_for_domain(urllib.parse.urlparse(args[1]).netloc):
             return cmd_nxm(args[1])
 
-    if not LARIAN or not os.path.isdir(LARIAN):
-        print("Installazione di Baldur's Gate 3 non trovata.\n\n"
-              "Ho cercato nei prefix di Steam, Heroic, Lutris, Bottles e in ~/.wine.\n"
-              "Se BG3 e' altrove, indica la cartella dati di Larian in uno dei due modi:\n\n"
-              "  - variabile d'ambiente PAKRAT_LARIAN\n"
-              f"  - chiave \"larian_dir\" in {os.path.join(CONFIG_DIR, 'config.json')}\n\n"
-              "Deve puntare alla cartella che contiene Mods/ e PlayerProfiles/,\n"
-              "tipicamente .../AppData/Local/Larian Studios/Baldur's Gate 3\n\n"
-              "Oppure lancia:  pakrat setup",
-              file=sys.stderr)
-        return 1
+    # senza argomenti si sceglie il gioco: e' l'unico punto del tool che non
+    # deve dare per scontato BG3
     if not args:
-        curses.wrapper(tui)
-        return 0
+        return game_menu()
+    if not LARIAN or not os.path.isdir(LARIAN):
+        print(BG3_NOT_FOUND, file=sys.stderr)
+        return 1
     cmd = args[0]
     if cmd == "list":
         cmd_list()
