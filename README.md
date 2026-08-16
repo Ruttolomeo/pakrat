@@ -476,6 +476,26 @@ preso dal feed statistico pubblico di Nexus (una richiesta, nessuna chiave, ness
 quota consumata) e non da una tabella che invecchia — e installando ne risolve la
 catena, avvisando se un altro corpo per lo stesso personaggio e' gia' li'.
 
+**`pakrat cp2077 preset 1|2`** installa un ramo intero. Un preset qui non e' un
+pacchetto ma un **punto di partenza**: due o tre ID da cui far partire la
+risoluzione delle dipendenze descritta sopra. I refit dei vestiti percio' non
+sono elencati nel codice — li dichiara l'autore del corpo nella sua tabella
+Requirements, ed e' l'unico posto dove restano aggiornati quando la mod cambia.
+
+    ramo 1 (vtk)     mesh nuova + la silhouette che scegli fra quattro
+    ramo 2 (spawn0)  proporzioni regolabili in gioco, mesh intatta
+
+Sul ramo 1 il preset chiede quale variante (o `--variante N`), e tira dentro il
+suo pacchetto di refit per il guardaroba base **e** quello di Phantom Liberty,
+ma solo se la DLC risulta installata. Sul ramo 2 i refit non esistono e non
+servono, e il comando lo dice invece di inventarsi qualcosa da installare.
+
+Dalla catena si escludono gli **attrezzi da modder** — WolvenKit, il Blender
+add-on — che compaiono nei Requirements delle mod-risorsa perche' servono a chi
+le fa, non a chi le usa. Si riconoscono per nome, perche' l'API non offre di
+meglio: WolvenKit e ArchiveXL hanno gli stessi identici tag, e la categoria non
+discrimina (Input Loader e' "Utilities" come WolvenKit, ed e' una mod vera).
+
 L'elenco dei corpi e' l'unico pezzo scritto a mano, e non poteva essere altrimenti:
 l'API non sa dire ne' "questa mod e' un corpo" ne' "questa esclude quest'altra".
 Con esso il comando dichiara la cosa che conta davvero e che nessuna automazione

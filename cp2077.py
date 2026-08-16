@@ -2346,6 +2346,21 @@ def _framework_by_name(nome):
     return ""
 
 
+# Attrezzi da MODDER, non mod da installare in gioco. Compaiono nei Requirements
+# delle mod-risorsa perche' servono a CHI le fa, non a chi le usa: WolvenKit e'
+# l'editor, il Blender add-on serve a esportare le mesh. Si riconoscono per nome
+# perche' l'API non offre di meglio — WolvenKit e ArchiveXL hanno gli stessi
+# identici tag, e la categoria non discrimina (Input Loader e' "Utilities" come
+# WolvenKit, ma e' una mod a tutti gli effetti).
+MOD_TOOLS = ("wolvenkit", "blenderadd", "blenderplugin", "cp77tools", "noesis",
+             "mlsetupbuilder", "redmod")
+
+
+def _is_tool(nome):
+    k = re.sub(r"[^a-z0-9]+", "", (nome or "").lower())
+    return any(t in k for t in MOD_TOOLS)
+
+
 def skip_reason(mod_id, api_key, install, have):
     """Perche' questa dipendenza non va installata, o stringa vuota.
 
@@ -2356,7 +2371,10 @@ def skip_reason(mod_id, api_key, install, have):
     """
     if mod_id in have:
         return "gia' installata"
-    f = _framework_by_name(mod_name(mod_id, api_key))
+    nome = mod_name(mod_id, api_key)
+    if _is_tool(nome):
+        return "e' un attrezzo da modder, non una mod da installare"
+    f = _framework_by_name(nome)
     if f and framework_present(f, install):
         return f"gia' presente come core mod ({f})"
     return ""
@@ -2511,18 +2529,22 @@ BODIES = [
              "tante: e' la base su cui poggiano tutte le varianti qui sotto"},
     {"id": 4654, "nome": "Enhanced Big Breasts (EBB)", "fam": "VTK",
      "chi": "V femmina", "tipo": "variante", "refit": "auto",
+     "refit_dlc": "due pacchetti: vanilla + Phantom Liberty",
      "nota": "seno molto piu' pronunciato e scollatura marcata. La piu' diffusa "
              "delle varianti"},
     {"id": 9083, "nome": "PUSH UP - EBB (EBBP)", "fam": "VTK",
      "chi": "V femmina", "tipo": "variante", "refit": "auto",
+     "refit_dlc": "due pacchetti: vanilla + Phantom Liberty",
      "nota": "EBB rivista perche' la scollatura renda meglio VESTITA, invece "
              "che nuda. Stesso autore"},
     {"id": 14896, "nome": "VTK Hyst - Angel", "fam": "VTK",
      "chi": "V femmina", "tipo": "variante", "refit": "auto",
+     "refit_dlc": "un pacchetto solo, che copre vanilla E DLC",
      "nota": "altra silhouette a seno grande; l'unica che dichiara anche il "
              "supporto ai body type tag di ArchiveXL"},
     {"id": 4420, "nome": "MORE REALISTIC BUTT (RB)", "fam": "VTK",
      "chi": "V femmina", "tipo": "variante", "refit": "auto",
+     "refit_dlc": "un pacchetto solo, che la DLC non la nomina",
      "nota": "lavora sui fianchi invece che sul seno, con proporzioni piu' "
              "contenute"},
     {"id": 1424, "nome": "spawn0 - BODY MOD 2.0", "fam": "spawn0",
@@ -2728,6 +2750,184 @@ def cmd_body(args):
         done.append(slug)
     if done:
         print(f"\n{len(done)} installate. Controlla con: pakrat cp2077 list")
+        _cfg, ns = cfg_load()
+        fw = sorted({x for s in done for x in missing_frameworks(
+            (ns.get("mods") or {}).get(s, {}).get("files") or [], install)})
+        offer_bootstrap(fw, install)
+    return rc
+
+
+# ------------------------------------------------------------------ preset ---
+# Un preset non e' un pacchetto: e' un PUNTO DI PARTENZA, cioe' un paio di mod da
+# cui far partire la risoluzione delle dipendenze che gia' esiste. Cosi' i refit
+# dei vestiti non stanno scritti qui — li dichiara l'autore del corpo nella sua
+# tabella Requirements, e li prendiamo da li', che e' l'unico posto dove restano
+# aggiornati quando la mod cambia.
+#
+# I rami sono due perche' le strade sono due, e non si mescolano: o si sostituisce
+# la mesh (VTK, e sopra una variante di silhouette), o si cambiano le proporzioni
+# lasciando la mesh dov'e' (spawn0).
+PRESETS = {
+    "vtk": {
+        "titolo": "VTK — mesh nuova, e sopra la silhouette che scegli",
+        "base": 7054,
+        "varianti": [4654, 9083, 14896, 4420],
+        "come": "Rifa' mesh e texture del corpo. La base da sola tiene le\n"
+                "proporzioni vanilla, quindi i vestiti calzano gia'; scegliendo\n"
+                "una variante le forme cambiano, e allora servono i refit —\n"
+                "che l'autore pubblica e che installo insieme.",
+    },
+    "spawn0": {
+        "titolo": "spawn0 — proporzioni regolabili in gioco, mesh intatta",
+        "base": 1424,
+        "extra": [18925],          # LOD MOD: l'autore lo marca REQ se cambi forma
+        "soft": [3783],            # UV framework: serve per le texture separate
+        "come": "Non tocca la mesh: cambia le proporzioni dal menu del gioco,\n"
+                "anche sugli NPC. Non servono refit — i vestiti seguono lo\n"
+                "scheletro — quindi qui non c'e' niente da rifare, ne' per il\n"
+                "guardaroba base ne' per quello delle DLC.",
+    },
+}
+PRESET_ALIAS = {"1": "vtk", "2": "spawn0", "ramo1": "vtk", "ramo2": "spawn0"}
+
+
+def _body_by_id(mod_id):
+    return next((b for b in BODIES if b["id"] == mod_id), None)
+
+
+def _scegli_variante(p, api_key):
+    """La variante di silhouette, chiesta se c'e' un terminale. None = solo base."""
+    print("\nvarianti di silhouette (tutte poggiano sulla base, "
+          "una sola per volta):\n")
+    for n, vid in enumerate(p["varianti"], 1):
+        b = _body_by_id(vid) or {}
+        print(f"  {n}  {b.get('nome', vid)[:34]:<34} refit: "
+              f"{b.get('refit_dlc', '?')}")
+    print("  0  nessuna: solo la base, forme vanilla e nessun refit da installare")
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("\nda script scegli con --variante N (o --variante 0 per la sola base)")
+        return "annulla"
+    try:
+        r = input("\nquale? [0-%d]: " % len(p["varianti"])).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "annulla"
+    if r == "0":
+        return None
+    if r.isdigit() and 1 <= int(r) <= len(p["varianti"]):
+        return p["varianti"][int(r) - 1]
+    print("scelta non valida.", file=sys.stderr)
+    return "annulla"
+
+
+def cmd_preset(args):
+    """Installa un ramo intero: corpo, prerequisiti e refit dei vestiti."""
+    install = resolve_install_dir()
+    if not install:
+        return _no_install()
+    api_key = core().load_config().get("nexus_api_key")
+    if not api_key:
+        print("API key non configurata: pakrat apikey LA_TUA_CHIAVE", file=sys.stderr)
+        return 1
+    refs = [a for a in args if not a.startswith("-")]
+    if not refs:
+        stats = download_counts()
+        print("i due rami possibili. Non si mescolano: scegline uno.\n")
+        for k, p in PRESETS.items():
+            b = _body_by_id(p["base"]) or {}
+            uniq = stats.get(p["base"], (0, 0))[1]
+            n = "1" if k == "vtk" else "2"
+            print(f"  ramo {n} ({k}) — {p['titolo']}")
+            for riga in _wrap(p["come"].replace("\n", " "), 68):
+                print(f"      {riga}")
+            print(f"      base: {b.get('nome', p['base'])} ({uniq} utenti)")
+            if p.get("varianti"):
+                print(f"      {len(p['varianti'])} varianti di silhouette fra cui "
+                      "scegliere")
+            print()
+        print("uso:  pakrat cp2077 preset 1 [--variante N]\n"
+              "      pakrat cp2077 preset 2\n"
+              "      --dry-run per vedere cosa installerebbe, senza farlo")
+        return 0
+
+    key = PRESET_ALIAS.get(refs[0].lower(), refs[0].lower())
+    p = PRESETS.get(key)
+    if p is None:
+        print(f"ramo sconosciuto: {refs[0]} (sono 1/vtk e 2/spawn0)", file=sys.stderr)
+        return 1
+    print(p["titolo"] + "\n")
+    for riga in _wrap(p["come"].replace("\n", " "), 72):
+        print(riga)
+
+    seeds = [p["base"]]
+    if key == "vtk":
+        scelta = None
+        if "--variante" in args:
+            i = args.index("--variante")
+            v = args[i + 1] if i + 1 < len(args) else ""
+            if v == "0":
+                scelta = None
+            elif v.isdigit() and 1 <= int(v) <= len(p["varianti"]):
+                scelta = p["varianti"][int(v) - 1]
+            elif v.isdigit():
+                scelta = int(v)                      # un ID Nexus diretto
+            else:
+                print(f"--variante non valido: {v}", file=sys.stderr)
+                return 1
+        else:
+            scelta = _scegli_variante(p, api_key)
+            if scelta == "annulla":
+                return 1
+        if scelta:
+            seeds.append(scelta)
+    else:
+        seeds += p.get("extra", [])
+        if "--minimo" not in args:
+            seeds += p.get("soft", [])
+
+    print("\nrisolvo le dipendenze (refit compresi, dalla tabella dell'autore):\n")
+    plan = expand_reqs(seeds, api_key, install)
+    if not plan:
+        print("non c'e' niente da installare: e' gia' tutto qui.")
+        return 0
+    print("\ninstallerei, in quest'ordine:")
+    for i in plan:
+        nome = mod_name(i, api_key)
+        b = _body_by_id(i)
+        etichetta = "  <- il corpo" if b and b["tipo"] in ("base", "variante") else ""
+        print(f"  {i:>6}  {nome[:56]}{etichetta}")
+    if key == "spawn0" and "--minimo" not in args:
+        print("\n(-KS- UV Texture Framework l'autore lo marca SOFT: serve appena\n"
+              " vuoi texture del corpo diverse da quelle degli NPC, ed e' il\n"
+              " prerequisito di mezzo Nexus. --minimo lo salta.)")
+    if "--dry-run" in args:
+        print("\n(--dry-run: non ho scaricato niente)")
+        return 0
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("\nda script non installo senza conferma: rilancia da terminale.")
+        return 0
+    if not require_game_closed():
+        return 1
+    try:
+        r = input("\nprocedo? [s/N]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    if r not in ("s", "si", "sì", "y", "yes"):
+        print("ok, non faccio niente.")
+        return 0
+    rc, done = 0, []
+    for i in plan:
+        slug, err = fetch_and_install(i, api_key, install, enable=True)
+        if err:
+            print(f"  {err}", file=sys.stderr)
+            rc = 1
+            continue
+        done.append(slug)
+    if done:
+        print(f"\n{len(done)} mod installate. Controlla con: pakrat cp2077 list")
+        print("Ordine di caricamento: vince il PRIMO file in ordine alfabetico,\n"
+              "quindi se un refit non si vede, guarda 'pakrat cp2077 order'.")
         _cfg, ns = cfg_load()
         fw = sorted({x for s in done for x in missing_frameworks(
             (ns.get("mods") or {}).get(s, {}).get("files") or [], install)})
@@ -3006,6 +3206,9 @@ HELP = """pakrat cp2077 - Cyberpunk 2077
   reqs ID               cosa pretende una mod, dedotto dalla pagina Nexus
   body [N|ID]           elenca i corpi opzionali, o ne installa uno con la
                         sua catena (--dry-run mostra e basta)
+  preset [1|2]          installa un ramo intero: corpo, prerequisiti e refit
+                        dei vestiti (base e DLC). --variante N sceglie la
+                        silhouette, --dry-run mostra e basta
   link MOD ID           associa una mod alla sua pagina Nexus
   check                 cerca aggiornamenti su Nexus
   update [MOD]          scarica e installa gli aggiornamenti
@@ -3044,6 +3247,7 @@ def main(args):
         "get": lambda: cmd_get(rest),
         "reqs": lambda: cmd_reqs(rest),
         "body": lambda: cmd_body(rest),
+        "preset": lambda: cmd_preset(rest),
         "install": lambda: cmd_get(rest),
         "bootstrap": lambda: cmd_bootstrap(rest),
         "core": lambda: cmd_bootstrap(rest),
