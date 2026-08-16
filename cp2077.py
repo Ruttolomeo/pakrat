@@ -2391,25 +2391,34 @@ def cmd_reqs(args):
 # invecchiano. La selezione e' quella dei piu' scaricati al 2026-08-16.
 BODIES = [
     {"id": 7054, "nome": "VTK Vanilla HD Body for FemV", "fam": "VTK",
-     "chi": "V femmina", "tipo": "sculpt",
-     "nota": "resta fedele alla forma vanilla; e' la base su cui poggiano quasi "
-             "tutti gli altri corpi femminili"},
+     "chi": "V femmina", "tipo": "sculpt", "refit": "no",
+     "nota": "mesh e texture in alta risoluzione MANTENENDO le proporzioni "
+             "vanilla: i vestiti del gioco continuano a calzare. Aggiunge il "
+             "supporto a capezzoli, genitali e overlay. E' la base su cui "
+             "poggiano quasi tutti gli altri corpi femminili"},
     {"id": 4654, "nome": "Enhanced Big Breasts (EBB)", "fam": "VTK",
-     "chi": "V femmina", "tipo": "sculpt",
-     "nota": "forme molto piu' pronunciate; poggia su VTK, non lo sostituisce"},
+     "chi": "V femmina", "tipo": "sculpt", "refit": "SI",
+     "nota": "poggia su VTK e ne cambia le forme, molto piu' pronunciate. "
+             "Cambiando forma servono i refit dei vestiti (l'autore ne "
+             "pubblica due, vanilla e Phantom Liberty) piu' le jiggle physics"},
     {"id": 1424, "nome": "spawn0 - BODY MOD 2.0", "fam": "spawn0",
-     "chi": "V femmina", "tipo": "rig",
-     "nota": "cambia le PROPORZIONI dal menu, in gioco: niente refit dei vestiti"},
+     "chi": "V femmina", "tipo": "rig", "refit": "no",
+     "nota": "non rifa' la mesh: cambia le PROPORZIONI (seno, fianchi, spalle, "
+             "cosce, braccia) da menu, in gioco, anche per gli NPC. Niente "
+             "refit. E' il piu' aggiornato del gruppo"},
     {"id": 3667, "nome": "spawn0 - HIGH POLY BODY", "fam": "spawn0",
-     "chi": "V femmina", "tipo": "sculpt",
-     "nota": "mesh ad alta densita', stessa famiglia di BODY MOD 2.0"},
+     "chi": "V femmina", "tipo": "add-on", "refit": "no",
+     "nota": "non e' un corpo a se': aggiunge poligoni al corpo femminile "
+             "perche' le forme spinte restino lisce. Fermo al 2022"},
     {"id": 6423, "nome": "Gymfiend - Body Mod - Male V", "fam": "VTK",
-     "chi": "V maschio", "tipo": "sculpt",
-     "nota": "l'equivalente VTK per V maschile"},
+     "chi": "V maschio", "tipo": "sculpt", "refit": "SI",
+     "nota": "corpo muscoloso per V maschile, lineage VTK. E' l'unica opzione "
+             "maschile con una diffusione seria"},
     {"id": 3725, "nome": "Framework - Unique V Body Shape - Rig", "fam": "rig",
-     "chi": "V", "tipo": "rig",
-     "nota": "storico, l'autore lo marca LEGACY: da' a V una forma diversa dagli "
-             "NPC senza toccare le mesh"},
+     "chi": "V", "tipo": "rig", "refit": "no",
+     "nota": "da' a V una forma diversa da quella degli NPC senza toccare le "
+             "mesh. L'autore lo marca LEGACY: usalo solo se una mod te lo "
+             "chiede esplicitamente"},
 ]
 
 # I download si chiedono al feed statistico pubblico di Nexus invece che all'API:
@@ -2454,6 +2463,18 @@ def download_counts():
 BODY_KEYS = {b["id"] for b in BODIES}
 
 
+def _wrap(testo, largo):
+    """Spezza una nota lunga in righe, senza dipendere da textwrap per due usi."""
+    fuori, riga = [], ""
+    for w in testo.split():
+        if len(riga) + len(w) + 1 > largo:
+            fuori.append(riga)
+            riga = w
+        else:
+            riga = f"{riga} {w}".strip()
+    return fuori + ([riga] if riga else [])
+
+
 def cmd_body(args):
     """Scegli un corpo e installa quello che serve per farlo funzionare."""
     install = resolve_install_dir()
@@ -2470,19 +2491,22 @@ def cmd_body(args):
     if not refs:
         print("corpi per V (uno per volta: si sostituiscono la stessa mesh)\n")
         print(f"{'#':>2}  {'ID':>5}  {'CORPO':<38} {'CHI':<10} {'TIPO':<7} "
-              f"{'UTENTI':>9}")
+              f"{'REFIT':<5} {'UTENTI':>9}")
         for i, b in enumerate(BODIES, 1):
             _dl, uniq = stats.get(b["id"], (0, 0))
             mark = "  *" if b["id"] in have else ""
             print(f"{i:>2}  {b['id']:>5}  {b['nome'][:38]:<38} {b['chi']:<10} "
-                  f"{b['tipo']:<7} {uniq:>9}{mark}")
-            print(f"      {b['nota']}")
+                  f"{b['tipo']:<7} {b['refit']:<5} {uniq:>9}{mark}")
+            for riga in _wrap(b["nota"], 68):
+                print(f"      {riga}")
         if any(b["id"] in have for b in BODIES):
             print("\n* gia' installato")
-        print("\nsculpt = rifa' la mesh: i VESTITI vanno rifatti su quella forma\n"
-              "         (i 'refit' sono mod a parte, una per outfit) — e' qui che\n"
-              "         sta il grosso del lavoro, e pakrat non lo puo' fare per te\n"
-              "rig    = cambia le proporzioni dello scheletro: nessun refit\n")
+        print("\nsculpt = rifa' la mesh   rig = cambia le proporzioni dello scheletro")
+        print("REFIT  = i vestiti vanno rifatti sulla nuova forma, altrimenti\n"
+              "         compenetrano. I refit sono mod a parte, di solito una per\n"
+              "         guardaroba (vanilla, Phantom Liberty, ogni mod di vestiti):\n"
+              "         e' qui che sta il grosso del lavoro, e non e' automatizzabile.\n"
+              "         Un corpo che tiene le proporzioni vanilla non ne ha bisogno.\n")
         print("per installarne uno:  pakrat cp2077 body N   (o l'ID Nexus)")
         print("cosa pretende uno:    pakrat cp2077 reqs ID")
         return 0
