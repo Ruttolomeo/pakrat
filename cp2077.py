@@ -2209,8 +2209,81 @@ def _plain_lines(desc):
     return [" ".join(x.split()) for x in t.split("\n")]
 
 
-def page_requirements(mod_id, api_key, info=None):
-    """[(id, forza, riga)] dedotti dalla descrizione. forza: 'richiesto'|'citato'."""
+def _game_id(api_key):
+    """L'ID numerico del gioco, che GraphQL pretende per filtrare sul modId.
+
+    Si chiede una volta e si ricorda nel config: e' un dato del sito, non nostro,
+    e cablarlo vorrebbe dire avere un numero magico che nessuno sa spiegare.
+    """
+    cfg, ns = cfg_load()
+    gid = ns.get("nexus_game_id")
+    if not gid:
+        gid = str(nexus_get("", api_key).get("id") or "")
+        if gid:
+            ns["nexus_game_id"] = gid
+            cfg_save(cfg)
+    return gid
+
+
+# Le note che l'autore scrive accanto a un requisito. "SOFT REQ", "not
+# mandatory", "only if you have the DLC": dicono che la dipendenza esiste ma non
+# e' incondizionata, ed e' la differenza fra installare 3 mod e installarne 9.
+_SOFT_RE = re.compile(r"\b(soft|not mandatory|optional|recommand\w*|recommend\w*|"
+                      r"no need|non obbligator\w*)\b", re.I)
+_COND_RE = re.compile(r"\b(only if|if you|se hai|solo se|in case)\b", re.I)
+
+
+def nexus_requirements(mod_id, api_key):
+    """[(id, classe, nome, nota)] dalla tabella Requirements della pagina Nexus.
+
+    Questa e' la fonte autorevole: e' l'elenco che l'autore compila a mano nel
+    pannello della mod, ed e' esattamente quello che si vede sul sito sotto
+    "Nexus requirements". Ci si arriva SOLO da GraphQL — l'API v1, quella dei
+    /mods/ID.json, non la espone, ed e' il motivo per cui a lungo abbiamo dedotto
+    i prerequisiti dalla descrizione (vedi described_requirements, che resta come
+    ripiego per le mod che la tabella non l'hanno compilata).
+
+    classe: 'richiesto' | 'condizionato' | 'consigliato'
+    """
+    gid = _game_id(api_key)
+    if not gid:
+        return []
+    q = ("query($f:ModsFilter,$c:Int){mods(filter:$f,count:$c,"
+         "viewUserBlockedContent:true){nodes{modId modRequirements{"
+         "nexusRequirements{nodes{modId modName notes externalRequirement url}}}}}}")
+    f = {"gameId": [{"value": str(gid), "op": "EQUALS"}],
+         "modId": [{"value": str(mod_id), "op": "EQUALS"}]}
+    try:
+        d = core().nexus_graphql(q, {"f": f, "c": 1}, api_key)
+    except Exception:
+        return []
+    nodes = d.get("mods", {}).get("nodes") or []
+    if not nodes:
+        return []
+    reqs = ((nodes[0].get("modRequirements") or {})
+            .get("nexusRequirements", {}).get("nodes") or [])
+    out = []
+    for r in reqs:
+        if r.get("externalRequirement") or not r.get("modId"):
+            continue                      # sta fuori da Nexus: non lo installiamo
+        nota = " ".join(str(r.get("notes") or "").split())
+        if _SOFT_RE.search(nota):
+            classe = "consigliato"
+        elif _COND_RE.search(nota):
+            classe = "condizionato"
+        else:
+            classe = "richiesto"
+        out.append((int(r["modId"]), classe, str(r.get("modName") or ""), nota))
+    return out
+
+
+def described_requirements(mod_id, api_key, info=None):
+    """[(id, forza, riga)] dedotti dalla descrizione. forza: 'richiesto'|'citato'.
+
+    Ripiego per quando la tabella Requirements e' vuota: molti autori i
+    prerequisiti li scrivono solo a parole, ma il link alla mod ce lo mettono, e
+    un link contiene l'ID.
+    """
     if info is None:
         info = nexus_get(f"/mods/{mod_id}.json", api_key)
     found = {}
@@ -2289,6 +2362,37 @@ def skip_reason(mod_id, api_key, install, have):
     return ""
 
 
+def has_phantom_liberty(install):
+    """True se la DLC e' installata: e' una cartella, non un flag da chiedere."""
+    return os.path.isdir(os.path.join(install, "archive", "pc", "ep1"))
+
+
+_DLC_RE = re.compile(r"\b(dlc|phantom liberty|ep1)\b", re.I)
+
+
+def requirements(mod_id, api_key, install=None):
+    """[(id, classe, nome, nota, fonte)] — la tabella se c'e', se no la descrizione.
+
+    'fonte' serve a chi legge: quello che l'autore ha DICHIARATO nel pannello
+    della mod ha un peso diverso da quello che ho dedotto io da una frase.
+    """
+    tab = nexus_requirements(mod_id, api_key)
+    if tab:
+        out = []
+        for i, cl, nm, nota in tab:
+            # "Only if you have the DLC" e' una condizione che sappiamo valutare:
+            # Phantom Liberty o c'e' sul disco o non c'e'
+            if cl == "condizionato" and install and _DLC_RE.search(nota):
+                cl = "richiesto" if has_phantom_liberty(install) else "non serve"
+                nota += ("  [hai la DLC]" if cl == "richiesto"
+                         else "  [la DLC non e' installata]")
+            out.append((i, cl, nm, nota, "tabella"))
+        return out
+    return [(i, ("richiesto" if f == "richiesto" else "citato"), "", riga,
+             "descrizione")
+            for i, f, riga in described_requirements(mod_id, api_key)]
+
+
 def expand_reqs(ids, api_key, install, depth=1):
     """Gli ID da installare, prerequisiti prima. Salta quelli gia' installati.
 
@@ -2311,15 +2415,15 @@ def expand_reqs(ids, api_key, install, depth=1):
 
     for mod_id in ids:
         try:
-            reqs = [(i, f, l) for i, f, l in page_requirements(mod_id, api_key)
-                    if f == "richiesto"]
+            reqs = [r for r in requirements(mod_id, api_key, install)
+                    if r[1] == "richiesto"]
         except Exception as ex:
             print(f"  dipendenze di {mod_id} non leggibili: {ex}", file=sys.stderr)
             reqs = []
-        for i, _f, _l in reqs:
+        for i, _cl, _nm, _nota, _fonte in reqs:
             if depth > 1:
-                for j, f2, _l2 in page_requirements(i, api_key):
-                    if f2 == "richiesto":
+                for j, cl2, _n2, _t2, _f2 in requirements(i, api_key, install):
+                    if cl2 == "richiesto":
                         add(j)
             add(i)
         add(mod_id, root=True)
@@ -2341,37 +2445,46 @@ def cmd_reqs(args):
         return 1
     try:
         info = nexus_get(f"/mods/{mod_id}.json", api_key)
-        reqs = page_requirements(mod_id, api_key, info)
+        reqs = requirements(mod_id, api_key, resolve_install_dir())
     except Exception as ex:
         print(f"errore: {ex}", file=sys.stderr)
         return 1
     print(f"{info.get('name')} (v{info.get('version') or '?'})\n")
     if not reqs:
-        print("nessun prerequisito linkato nella descrizione.")
-        print("Non vuol dire che non ne abbia: vuol dire che l'autore non l'ha\n"
-              "scritto in modo leggibile da qui. Controlla la pagina:\n  "
+        print("nessun prerequisito: la tabella Requirements e' vuota e nella\n"
+              "descrizione non ci sono link ad altre mod.")
+        print("Non vuol dire che non ne abbia — controlla la pagina:\n  "
               + page_url(mod_id))
         return 0
     have = _installed_nexus_ids()
     install = resolve_install_dir()
-    reqs.sort(key=lambda r: (r[1] != "richiesto", r[0]))
+    fonte = reqs[0][4]
+    ordine = {"richiesto": 0, "condizionato": 1, "consigliato": 2, "citato": 3,
+              "non serve": 4}
+    reqs.sort(key=lambda r: (ordine.get(r[1], 9), r[0]))
     shown = 0
-    for i, forza, line in reqs:
-        if forza == "citato" and shown >= 6:
+    for i, classe, nome, nota, _f in reqs:
+        if classe == "citato" and shown >= 6:
             continue
-        shown += 1 if forza == "citato" else 0
+        shown += 1 if classe == "citato" else 0
         mark = "gia' installata" if i in have else ""
-        print(f"  [{forza:<9}] {i:>6}  {mod_name(i, api_key)[:44]:<44} {mark}")
-        print(f"              \"{line[:96]}\"")
-    resto = sum(1 for _i, f, _l in reqs if f == "citato") - shown
+        print(f"  [{classe:<12}] {i:>6}  {(nome or mod_name(i, api_key))[:42]:<42} {mark}")
+        if nota:
+            print(f"                 \"{nota[:92]}\"")
+    resto = sum(1 for r in reqs if r[1] == "citato") - shown
     if resto > 0:
         print(f"  ... e altre {resto} citate nella descrizione (mod dell'autore,\n"
               "      alternative, ringraziamenti): non le tocco")
-    print("\n'richiesto' e 'citato' li deduco dalla frase in cui compare il link:\n"
-          "l'API Nexus i Requirements non li espone, la pagina web si'. Controlla\n"
-          "prima di fidarti:  " + page_url(mod_id))
+    if fonte == "tabella":
+        print("\nfonte: la tabella Requirements che l'autore compila sulla pagina.\n"
+              "Le classi vengono dalle sue note: 'SOFT REQ', 'not mandatory' e\n"
+              "simili diventano 'consigliato', 'only if...' diventa 'condizionato'.")
+    else:
+        print("\nfonte: la DESCRIZIONE, perche' la tabella Requirements e' vuota.\n"
+              "Qui 'richiesto' e 'citato' li deduco dalla frase in cui compare il\n"
+              "link: controlla prima di fidarti.  " + page_url(mod_id))
     if install:
-        miss = [i for i, f, _l in reqs if f == "richiesto" and i not in have]
+        miss = [r[0] for r in reqs if r[1] == "richiesto" and r[0] not in have]
         if miss:
             print(f"\ninstalla mod e prerequisiti: "
                   f"pakrat cp2077 get {mod_id} --with-reqs")
@@ -2391,29 +2504,40 @@ def cmd_reqs(args):
 # invecchiano. La selezione e' quella dei piu' scaricati al 2026-08-16.
 BODIES = [
     {"id": 7054, "nome": "VTK Vanilla HD Body for FemV", "fam": "VTK",
-     "chi": "V femmina", "tipo": "sculpt", "refit": "no",
+     "chi": "V femmina", "tipo": "base", "refit": "no",
      "nota": "mesh e texture in alta risoluzione MANTENENDO le proporzioni "
              "vanilla: i vestiti del gioco continuano a calzare. Aggiunge il "
-             "supporto a capezzoli, genitali e overlay. E' la base su cui "
-             "poggiano quasi tutti gli altri corpi femminili"},
+             "supporto a capezzoli, genitali e overlay. Non e' una scelta fra "
+             "tante: e' la base su cui poggiano tutte le varianti qui sotto"},
     {"id": 4654, "nome": "Enhanced Big Breasts (EBB)", "fam": "VTK",
-     "chi": "V femmina", "tipo": "sculpt", "refit": "SI",
-     "nota": "poggia su VTK e ne cambia le forme, molto piu' pronunciate. "
-             "Cambiando forma servono i refit dei vestiti (l'autore ne "
-             "pubblica due, vanilla e Phantom Liberty) piu' le jiggle physics"},
+     "chi": "V femmina", "tipo": "variante", "refit": "auto",
+     "nota": "seno molto piu' pronunciato e scollatura marcata. La piu' diffusa "
+             "delle varianti"},
+    {"id": 9083, "nome": "PUSH UP - EBB (EBBP)", "fam": "VTK",
+     "chi": "V femmina", "tipo": "variante", "refit": "auto",
+     "nota": "EBB rivista perche' la scollatura renda meglio VESTITA, invece "
+             "che nuda. Stesso autore"},
+    {"id": 14896, "nome": "VTK Hyst - Angel", "fam": "VTK",
+     "chi": "V femmina", "tipo": "variante", "refit": "auto",
+     "nota": "altra silhouette a seno grande; l'unica che dichiara anche il "
+             "supporto ai body type tag di ArchiveXL"},
+    {"id": 4420, "nome": "MORE REALISTIC BUTT (RB)", "fam": "VTK",
+     "chi": "V femmina", "tipo": "variante", "refit": "auto",
+     "nota": "lavora sui fianchi invece che sul seno, con proporzioni piu' "
+             "contenute"},
     {"id": 1424, "nome": "spawn0 - BODY MOD 2.0", "fam": "spawn0",
-     "chi": "V femmina", "tipo": "rig", "refit": "no",
-     "nota": "non rifa' la mesh: cambia le PROPORZIONI (seno, fianchi, spalle, "
-             "cosce, braccia) da menu, in gioco, anche per gli NPC. Niente "
-             "refit. E' il piu' aggiornato del gruppo"},
+     "chi": "V femmina", "tipo": "base", "refit": "no",
+     "nota": "l'altra strada: non rifa' la mesh, cambia le PROPORZIONI da menu "
+             "in gioco (seno, fianchi, spalle, cosce, braccia), anche sugli "
+             "NPC. Niente refit, ed e' il piu' aggiornato"},
     {"id": 3667, "nome": "spawn0 - HIGH POLY BODY", "fam": "spawn0",
      "chi": "V femmina", "tipo": "add-on", "refit": "no",
-     "nota": "non e' un corpo a se': aggiunge poligoni al corpo femminile "
-             "perche' le forme spinte restino lisce. Fermo al 2022"},
-    {"id": 6423, "nome": "Gymfiend - Body Mod - Male V", "fam": "VTK",
-     "chi": "V maschio", "tipo": "sculpt", "refit": "SI",
-     "nota": "corpo muscoloso per V maschile, lineage VTK. E' l'unica opzione "
-             "maschile con una diffusione seria"},
+     "nota": "non e' un corpo: aggiunge poligoni perche' le forme spinte "
+             "restino lisce. Fermo al 2022"},
+    {"id": 6423, "nome": "Gymfiend - Male V", "fam": "VTK",
+     "chi": "V maschio", "tipo": "variante", "refit": "auto",
+     "nota": "corpo muscoloso per V maschile. E' l'unica mesh maschile con una "
+             "diffusione seria: il resto sono texture"},
     {"id": 3725, "nome": "Framework - Unique V Body Shape - Rig", "fam": "rig",
      "chi": "V", "tipo": "rig", "refit": "no",
      "nota": "da' a V una forma diversa da quella degli NPC senza toccare le "
@@ -2490,23 +2614,25 @@ def cmd_body(args):
 
     if not refs:
         print("corpi per V (uno per volta: si sostituiscono la stessa mesh)\n")
-        print(f"{'#':>2}  {'ID':>5}  {'CORPO':<38} {'CHI':<10} {'TIPO':<7} "
+        print(f"{'#':>2}  {'ID':>5}  {'CORPO':<38} {'CHI':<10} {'TIPO':<8} "
               f"{'REFIT':<5} {'UTENTI':>9}")
         for i, b in enumerate(BODIES, 1):
             _dl, uniq = stats.get(b["id"], (0, 0))
             mark = "  *" if b["id"] in have else ""
             print(f"{i:>2}  {b['id']:>5}  {b['nome'][:38]:<38} {b['chi']:<10} "
-                  f"{b['tipo']:<7} {b['refit']:<5} {uniq:>9}{mark}")
+                  f"{b['tipo']:<8} {b['refit']:<5} {uniq:>9}{mark}")
             for riga in _wrap(b["nota"], 68):
                 print(f"      {riga}")
         if any(b["id"] in have for b in BODIES):
             print("\n* gia' installato")
-        print("\nsculpt = rifa' la mesh   rig = cambia le proporzioni dello scheletro")
-        print("REFIT  = i vestiti vanno rifatti sulla nuova forma, altrimenti\n"
-              "         compenetrano. I refit sono mod a parte, di solito una per\n"
-              "         guardaroba (vanilla, Phantom Liberty, ogni mod di vestiti):\n"
-              "         e' qui che sta il grosso del lavoro, e non e' automatizzabile.\n"
-              "         Un corpo che tiene le proporzioni vanilla non ne ha bisogno.\n")
+        print("\nbase     = il corpo vero e proprio; le VARIANTI ci poggiano sopra\n"
+              "           e non lo sostituiscono, quindi la base te la ritrovi\n"
+              "           installata comunque")
+        print("REFIT    = cambiando le forme i vestiti compenetrano e vanno rifatti.\n"
+              "           'auto' = l'autore pubblica i refit del guardaroba del gioco\n"
+              "           e li dichiara fra i Requirements, quindi li installo io\n"
+              "           (Phantom Liberty compresa, se ce l'hai). Restano da\n"
+              "           rifare a mano i vestiti delle ALTRE mod che usi.\n")
         print("per installarne uno:  pakrat cp2077 body N   (o l'ID Nexus)")
         print("cosa pretende uno:    pakrat cp2077 reqs ID")
         return 0
@@ -2537,32 +2663,37 @@ def cmd_body(args):
               "  caricamento, e non e' quello che vuoi. Disattiva l'altro con\n"
               "  'pakrat cp2077 disable' prima o dopo.\n")
 
-    print("dipendenze dedotte dalla pagina Nexus:")
+    print("dipendenze:")
     try:
-        reqs = page_requirements(b["id"], api_key)
+        reqs = requirements(b["id"], api_key, install)
     except Exception as ex:
         print(f"  non leggibili: {ex}", file=sys.stderr)
         reqs = []
     need, salti = [], {}
-    for i, f, _l in reqs:
-        if f != "richiesto":
+    for i, cl, _nm, _nota, _f in reqs:
+        if cl != "richiesto":
             continue
         why = skip_reason(i, api_key, install, have)
         salti[i] = why
         if not why:
             need.append(i)
-    for i, f, line in sorted(reqs, key=lambda r: r[1] != "richiesto"):
-        if f != "richiesto":
+    ordine = {"richiesto": 0, "condizionato": 1, "consigliato": 2, "citato": 3,
+              "non serve": 4}
+    altre = 0
+    for i, cl, nome, nota, _f in sorted(reqs, key=lambda r: ordine.get(r[1], 9)):
+        if cl in ("citato", "non serve"):
+            altre += 1
             continue
         stato = f"  ({salti.get(i)})" if salti.get(i) else ""
-        print(f"  {i:>6}  {mod_name(i, api_key)[:46]:<46}{stato}")
-        print(f"          \"{line[:88]}\"")
-    citate = [i for i, f, _l in reqs if f == "citato"]
-    if not need and not any(f == "richiesto" for _i, f, _l in reqs):
-        print("  nessuna dichiarata come richiesta nella descrizione")
-    if citate:
-        print(f"  (+{len(citate)} mod citate ma non dichiarate necessarie: refit dei\n"
-              "   vestiti, texture, alternative — quelle le scegli tu)")
+        etichetta = "" if cl == "richiesto" else f"[{cl}] "
+        print(f"  {i:>6}  {etichetta}{(nome or mod_name(i, api_key))[:44]:<44}{stato}")
+        if nota:
+            print(f"          \"{nota[:86]}\"")
+    if not any(r[1] == "richiesto" for r in reqs):
+        print("  nessuna dichiarata obbligatoria")
+    if altre:
+        print(f"  (+{altre} citate o non necessarie qui: refit di guardaroba che non\n"
+              "   hai, texture, alternative — quelle le scegli tu)")
     print(f"\n  pagina: {page_url(b['id'])}")
 
     plan = need + [b["id"]] if b["id"] not in have else need
