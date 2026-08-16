@@ -439,18 +439,26 @@ qualcosa e' esattamente quello che stavi cercando.
 
 ### Dipendenze fra mod, e i corpi
 
-L'API Nexus **non espone i Requirements** di una mod: stanno solo nella pagina
-web. La descrizione pero' l'API la da', e li' dentro gli autori i prerequisiti li
-**linkano** — con l'URL della mod, quindi con il suo ID. `pakrat cp2077 reqs ID`
-legge quella descrizione e ne ricava la catena, distinguendo *richiesto* da
-*citato* in base alla frase in cui il link compare (o alla sezione: una riga corta
-tipo "1. Install requirements" apre un blocco di prerequisiti). Su Equipment-EX
-ricava esattamente i cinque core mod che l'autore elenca.
+I Requirements di una mod l'API **li espone, ma solo via GraphQL**: l'API v1,
+quella dei `/mods/ID.json` che si usa per tutto il resto, non li ha, e il tipo
+`Mod` di GraphQL si' — `modRequirements.nexusRequirements` e' esattamente la
+tabella che l'autore compila a mano e che sul sito si legge sotto *Nexus
+requirements*, note comprese. `pakrat cp2077 reqs ID` legge quella.
 
-E' un'euristica dichiarata, non un grafo di dipendenze: una descrizione linka
-anche le mod consigliate, i refit alternativi e i ringraziamenti. Per questo non
-si installa niente senza mostrare prima la catena, e `get --with-reqs` scende di
-**un solo livello** — due, su testo scritto a mano, tirano dentro mezzo Nexus.
+Le note fanno il grosso del lavoro di classificazione, perche' gli autori ci
+scrivono dentro quanto una dipendenza sia vincolante: *SOFT REQ* e *not mandatory*
+diventano **consigliato**, *only if you have the DLC* diventa **condizionato**.
+E quest'ultima condizione pakrat la sa valutare da solo — Phantom Liberty o c'e'
+in `archive/pc/ep1` o non c'e' — quindi il refit della DLC entra nella catena solo
+se la DLC ce l'hai.
+
+Quando la tabella e' **vuota** (succede: non tutti la compilano) si ripiega sulla
+descrizione, dove i prerequisiti gli autori li linkano comunque, e un link
+contiene l'ID. Li' *richiesto* e *citato* si deducono dalla frase in cui il link
+compare, o dalla sezione (una riga corta tipo "1. Install requirements" apre un
+blocco). E' un'euristica, `reqs` dice sempre da quale delle due fonti sta
+leggendo, e in nessuno dei due casi si installa qualcosa senza aver mostrato prima
+la catena. `get --with-reqs` scende di **un solo livello**.
 
 Un prerequisito gia' soddisfatto viene saltato, e non solo guardando gli ID Nexus
 gia' associati: i core mod pakrat li prende dalle **release GitHub**, quindi nel
@@ -458,9 +466,12 @@ config un ID Nexus non ce l'hanno. Il confronto avviene allora sul nome, contro 
 tabella `FRAMEWORKS`; senza, una catena reinstallerebbe ArchiveXL da Nexus sopra
 quello che c'e' gia'.
 
-**`pakrat cp2077 body`** e' l'applicazione pratica: Cyberpunk non ha *il* body
-replacer, ne ha famiglie che si **escludono a vicenda** perche' sostituiscono la
-stessa mesh. Il comando elenca i piu' diffusi con il numero di utenti reale —
+**`pakrat cp2077 body`** e' l'applicazione pratica. Cyberpunk non ha *il* body
+replacer, ma nemmeno una scelta larga: ha **due basi** — VTK, che rifa' mesh e
+texture tenendo le proporzioni vanilla, e spawn0, che le proporzioni le cambia da
+menu senza toccare la mesh — e sopra VTK una serie di **varianti** di silhouette,
+ognuna col proprio pacchetto di refit. Basi e varianti si escludono a vicenda
+quando toccano la stessa mesh. Il comando elenca i piu' diffusi con il numero di utenti reale —
 preso dal feed statistico pubblico di Nexus (una richiesta, nessuna chiave, nessuna
 quota consumata) e non da una tabella che invecchia — e installando ne risolve la
 catena, avvisando se un altro corpo per lo stesso personaggio e' gia' li'.
