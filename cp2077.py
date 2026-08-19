@@ -2100,6 +2100,116 @@ def cmd_search(args):
     return 0
 
 
+# ------------------------------- altri file della stessa pagina Nexus ---
+# Una pagina Nexus non e' un pacchetto: puo' avere PIU' file MAIN che sono
+# pezzi diversi della stessa mod, non alternative fra cui scegliere. VTK
+# Vanilla HD pubblica corpo e testa separati, e pick_main_file() ne prende uno
+# solo — quello piu' recente — quindi da 'body', 'preset' o 'get' si finiva col
+# corpo in HD e la testa vanilla. Non da' errore: si vede solo la cucitura al
+# collo, e solo se non hai una mod di pelle sopra che la nasconde.
+#
+# I file si dichiarano per NOME e categoria, mai per file_id: il file_id cambia
+# a ogni upload dell'autore (v3.3 e v3.4 del corpo sono due id diversi), e un
+# id cablato che punta a un file archiviato e' peggio che non averlo. Il nome
+# invece l'autore lo tiene stabile fra le versioni, ed e' anche cio' su cui
+# remote_status() gia' aggancia gli aggiornamenti.
+#
+# 'serve': senza quel file la mod e' incompleta e la mancata corrispondenza va
+# segnalata come errore. Senza il flag e' un extra: se sparisce dalla pagina si
+# avvisa e si tira avanti.
+FILE_EXTRAS = {
+    7054: (                                    # VTK Vanilla HD Body for FemV
+        {"match": r"vanilla hd\s*-\s*head", "cat": "MAIN", "serve": True,
+         "perche": "mesh e morphtarget della testa: l'autore la marca "
+                   "'Required for full material support'"},
+        {"match": r"extra textures", "cat": "OPTIONAL",
+         "perche": "upscale di sopracciglia, cyberware, tatuaggi e capelli"},
+        {"match": r"global microdetail patch", "cat": "OPTIONAL",
+         "perche": "rende globale il microdetail VTK e chiude le cuciture con "
+                   "le altre mod di testa e pelle"},
+    ),
+}
+
+
+def _pick_by_name(files, rx, cat=None):
+    """Il file della pagina che corrisponde al nome, alla versione piu' alta."""
+    rx = re.compile(rx, re.I)
+    pool = [f for f in usable_files(files)
+            if rx.search(str(f.get("name") or ""))
+            and (not cat
+                 or str(f.get("category_name") or "").upper() == cat.upper())]
+    if not pool:
+        return None
+    return max(pool, key=lambda f: (_vkey(f.get("version")),
+                                    f.get("uploaded_timestamp") or 0))
+
+
+def file_extras(mod_id, files):
+    """[(file|None, spec)] per la mod: None se il nome non c'e' piu'."""
+    return [(_pick_by_name(files, sp["match"], sp.get("cat")), sp)
+            for sp in FILE_EXTRAS.get(int(mod_id), ())]
+
+
+def _file_installed(file_id, ns):
+    """Un file_id e' gia' sul disco? (una pagina = piu' slug, uno per file)"""
+    return any(int(e.get("installed_file_id") or 0) == int(file_id)
+               and not e.get("removed_at")
+               for e in (ns.get("mods") or {}).values())
+
+
+def install_file_extras(mod_id, api_key, install, files, enable=True):
+    """Installa gli altri file della pagina. Ritorna (slug fatti, rc).
+
+    'files' arriva da chi ci chiama, che l'ha appena chiesto a Nexus: non
+    spendiamo una seconda richiesta per la stessa pagina.
+    """
+    done, rc = [], 0
+    extras = file_extras(mod_id, files)
+    if not extras:
+        return done, rc
+    _cfg, ns = cfg_load()
+    for f, sp in extras:
+        if f is None:
+            dove = "obbligatorio" if sp.get("serve") else "opzionale"
+            print(f"  ATTENZIONE: il file {dove} che cercavo non e' piu' su "
+                  f"questa pagina ({sp['match']}): {sp['perche']}",
+                  file=sys.stderr)
+            if sp.get("serve"):
+                rc = 1
+            continue
+        if _file_installed(f["file_id"], ns):
+            print(f"  {f.get('name')}: gia' installato")
+            continue
+        print(f"  + {f.get('name')} (v{f.get('version') or '?'}) — "
+              f"{sp['perche']}")
+        slug, err = fetch_and_install(mod_id, api_key, install, enable=enable,
+                                      file_id=int(f["file_id"]))
+        if err:
+            print(f"    {err}", file=sys.stderr)
+            rc = 1
+            continue
+        done.append(slug)
+        _cfg, ns = cfg_load()          # il manifest e' cambiato sotto di noi
+    return done, rc
+
+
+def print_file_extras(mod_ids, api_key):
+    """Annuncia nel piano i file in piu' che verranno presi dalle stesse pagine."""
+    for mid in dict.fromkeys(int(m) for m in mod_ids):
+        if mid not in FILE_EXTRAS:
+            continue
+        try:
+            files = nexus_get(f"/mods/{mid}/files.json", api_key).get("files", [])
+        except Exception:
+            continue
+        for f, sp in file_extras(mid, files):
+            if f is None:
+                print(f"  {mid:>6}  ! non lo trovo piu': {sp['match']}")
+            else:
+                tag = "serve" if sp.get("serve") else "extra"
+                print(f"  {mid:>6}  + {str(f.get('name'))[:50]:<50}[{tag}]")
+
+
 def fetch_and_install(mod_id, api_key, install, enable=True, file_id=None,
                       preset_gender=None):
     """Scarica una mod da Nexus e la installa. Ritorna (slug, errore).
@@ -2156,11 +2266,23 @@ def fetch_and_install(mod_id, api_key, install, enable=True, file_id=None,
     # arrivando da Nexus l'associazione la sappiamo gia': registrarla qui evita
     # il 'link' a mano e fa funzionare 'check' da subito
     cfg, ns = cfg_load()
+    # Una pagina puo' dare piu' slug (corpo, testa, texture): se il file ce
+    # l'hanno chiesto per id, il nome che distingue e' quello del FILE, non
+    # quello della pagina — altrimenti 'list' e 'check' stampano quattro righe
+    # identiche. La versione, per lo stesso motivo, e' quella del file: la
+    # pagina dice 3.3 anche per la testa, che e' alla 3.1.
     link_slug(slug, mod_id, ns, file_id=f["file_id"],
-              version=str(info.get("version") or ""))
+              version=str((f.get("version") if file_id else info.get("version"))
+                          or ""))
     e = ns.setdefault("mods", {}).setdefault(slug, {})
-    e["display_name"] = name
+    e["display_name"] = str(f.get("name") or name) if file_id else name
     cfg_save(cfg)
+    # Se il file l'abbiamo scelto noi, la pagina puo' avere altri pezzi che
+    # vanno insieme a questo. Se invece ce l'ha chiesto chi ci chiama (--file),
+    # prende quello e basta: e' anche cio' che evita la ricorsione, perche' gli
+    # extra li installiamo per file_id.
+    if file_id is None:
+        install_file_extras(mod_id, api_key, install, files, enable=enable)
     return slug, ""
 
 
@@ -2378,14 +2500,42 @@ def page_url(mod_id):
     return f"https://www.nexusmods.com/{NEXUS_GAME}/mods/{mod_id}"
 
 
-def _installed_nexus_ids(ns=None):
+def _installed_nexus_ids(ns=None, attive_solo=False):
+    """{id Nexus: slug} delle mod che ci sono DAVVERO.
+
+    Le RIMOSSE non ci sono piu': 'remove' porta i file in
+    pakrat-cp2077/rimosse e nel manifest resta solo la traccia che serve a
+    'restore'. Contarle faceva due danni di segno opposto: avvisi di conflitto
+    per corpi che non sono installati, e — piu' grave — skip_reason() che
+    dichiara "gia' installata" una dipendenza rimossa e quindi NON la
+    reinstalla. Si sente appena si fa pulizia, quando le voci rimosse nel
+    manifest diventano piu' di quelle vive.
+
+    Le DISATTIVATE invece ci sono, in deposito, e non vanno riscaricate: basta
+    'enable'. Restano quindi contate per default. attive_solo=True le esclude,
+    ed e' quello che serve a chi ragiona su cosa il gioco CARICA — un corpo
+    disattivato non entra in conflitto con nessuno.
+    """
     if ns is None:
         _cfg, ns = cfg_load()
     out = {}
     for slug, e in (ns.get("mods") or {}).items():
-        if e.get("nexus_id"):
-            out[int(e["nexus_id"])] = slug
+        if not e.get("nexus_id") or e.get("removed_at"):
+            continue
+        if attive_solo and not e.get("enabled", True):
+            continue
+        out[int(e["nexus_id"])] = slug
     return out
+
+
+def _disattivata(mod_id, have, ns=None):
+    """True se quella mod c'e' ma e' in deposito: da riaccendere, non da ripescare."""
+    slug = have.get(int(mod_id))
+    if not slug:
+        return False
+    if ns is None:
+        _cfg, ns = cfg_load()
+    return not (ns.get("mods") or {}).get(slug, {}).get("enabled", True)
 
 
 def _framework_by_name(nome):
@@ -2422,6 +2572,11 @@ def skip_reason(mod_id, api_key, install, have):
     compagnia da Nexus, sopra quelli che ci sono gia'.
     """
     if mod_id in have:
+        # presente ma spenta: i file ci sono, riscaricarla non serve a niente.
+        # Va detto, perche' altrimenti la si conta come a posto e in gioco non
+        # carica.
+        if _disattivata(mod_id, have):
+            return "presente ma DISATTIVATA: serve 'enable', non un download"
         return "gia' installata"
     nome = mod_name(mod_id, api_key)
     if _is_tool(nome):
@@ -2692,7 +2847,8 @@ def cmd_body(args):
               f"{'REFIT':<5} {'UTENTI':>9}")
         for i, b in enumerate(BODIES, 1):
             _dl, uniq = stats.get(b["id"], (0, 0))
-            mark = "  *" if b["id"] in have else ""
+            mark = ("  * (disattivata)" if _disattivata(b["id"], have)
+                    else "  *" if b["id"] in have else "")
             print(f"{i:>2}  {b['id']:>5}  {b['nome'][:38]:<38} {b['chi']:<10} "
                   f"{b['tipo']:<8} {b['refit']:<5} {uniq:>9}{mark}")
             for riga in _wrap(b["nota"], 68):
@@ -2725,7 +2881,10 @@ def cmd_body(args):
         print(f"non e' un indice ne' un ID: {ref}", file=sys.stderr)
         return 1
 
-    conflitti = [x for x in BODIES if x["id"] in have and x["id"] != b["id"]
+    # per il conflitto conta solo cio' che il gioco CARICA: un corpo
+    # disattivato ha i file in deposito e non si sovrappone a niente
+    attive = _installed_nexus_ids(attive_solo=True)
+    conflitti = [x for x in BODIES if x["id"] in attive and x["id"] != b["id"]
                  and x["chi"] == b.get("chi")]
     print(f"{b.get('nome') or b['id']}  ({b['chi']}, {b['tipo']})")
     print(f"  {b['nota']}\n")
@@ -2771,10 +2930,15 @@ def cmd_body(args):
     print(f"\n  pagina: {page_url(b['id'])}")
 
     plan = need + [b["id"]] if b["id"] not in have else need
+    if _disattivata(b["id"], have):
+        print(f"\n{b.get('nome') or b['id']} e' gia' qui ma DISATTIVATA: i file\n"
+              f"stanno in deposito. Riaccendila invece di riscaricarla:\n"
+              f"  pakrat cp2077 enable id:{b['id']}")
     if not plan:
         print("\nnon c'e' niente da installare: e' gia' tutto qui.")
         return 0
     print("\ninstallerei, in quest'ordine: " + ", ".join(str(i) for i in plan))
+    print_file_extras(plan, api_key)
     if "--dry-run" in args:
         print("(--dry-run: non ho scaricato niente)")
         return 0
@@ -3353,6 +3517,7 @@ def cmd_preset(args):
         b = _body_by_id(i)
         etichetta = "  <- il corpo" if b and b["tipo"] in ("base", "variante") else ""
         print(f"  {i:>6}  {nome[:56]}{etichetta}")
+    print_file_extras(plan, api_key)
     if key == "spawn0" and "--minimo" not in args:
         print("\n(-KS- UV Texture Framework l'autore lo marca SOFT: serve appena\n"
               " vuoi texture del corpo diverse da quelle degli NPC, ed e' il\n"
