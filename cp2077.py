@@ -68,6 +68,16 @@ PROTECTED_FILES = ("bin/x64/cyberpunk2077.exe", "bin/x64/oo2ext_7_win64.dll",
 
 ARCHIVE_MOD_DIR = os.path.join("archive", "pc", "mod")
 
+# Dove ACU tiene i preset del personaggio. Le due sottocartelle non sono un
+# dettaglio di ordine: ACU nel menu mostra SOLO quella che corrisponde al corpo
+# di V, quindi un preset maschile finito fra i femminili non e' mal messo, e'
+# invisibile. Quasi tutti gli archivi di preset portano questo percorso dentro
+# di se' e allora decide l'autore; per quelli che sono un .preset nudo il ramo
+# lo dobbiamo scegliere noi, e da li' nasce ACU_GENDERS.
+ACU_PRESET_DIR = ("bin/x64/plugins/cyber_engine_tweaks/mods/"
+                  "AppearanceChangeUnlocker/character-presets")
+ACU_GENDERS = ("male", "female")
+
 # I "core mod": non aggiungono contenuto, lo rendono possibile. Quasi ogni mod
 # moderna ne pretende almeno uno.
 #
@@ -672,7 +682,7 @@ def _find_game_root(tree):
     return best
 
 
-def _loose_layout(tree, slug):
+def _loose_layout(tree, slug, preset_gender=None):
     """Archivi che NON portano la struttura del gioco: deduciamo dove va cosa.
 
     Molte mod piccole sono un .archive nudo, o una manciata di .reds, e si
@@ -697,15 +707,26 @@ def _loose_layout(tree, slug):
             plan.append((src, f"r6/tweaks/{slug}/{base}"))
         elif low == "init.lua":
             plan.append((src, f"bin/x64/plugins/cyber_engine_tweaks/mods/{slug}/{base}"))
+        elif low.endswith(".preset"):
+            # Un preset ACU nudo. Senza sapere se e' per il corpo maschile o
+            # femminile non lo mettiamo da nessuna parte: indovinare qui
+            # significherebbe scriverlo in una cartella dove non comparira' mai
+            # nel menu, che e' peggio del non averlo installato.
+            if preset_gender in ACU_GENDERS:
+                plan.append((src, f"{ACU_PRESET_DIR}/{preset_gender}/{base}"))
+            else:
+                plan.append((None, rel))
         else:
             plan.append((None, rel))          # segnalato, non installato
     return plan
 
 
-def plan_install(tree, slug):
+def plan_install(tree, slug, preset_gender=None):
     """Cosa va copiato dove. Ritorna (coppie, ignorati, tipi).
 
     'coppie' sono (sorgente_assoluta, destinazione_relativa_alla_radice).
+    'preset_gender' serve solo agli archivi che non portano una struttura: dice
+    in quale dei due rami di ACU va un .preset sciolto.
     """
     root = _find_game_root(tree)
     pairs, ignored = [], []
@@ -714,7 +735,7 @@ def plan_install(tree, slug):
             pairs.append((os.path.join(root, rel.replace("/", os.sep)), rel))
     else:
         # niente struttura riconoscibile: proviamo a dedurla dai file
-        loose = _loose_layout(tree, slug)
+        loose = _loose_layout(tree, slug, preset_gender)
         redmod_dirs = {d.split("/")[1] for s, d in loose
                        if s and d.startswith("mods/") and len(d.split("/")) > 1}
         for src, dest in loose:
@@ -746,7 +767,9 @@ def plan_install(tree, slug):
             ignored.append(dest)
             continue
         safe.append((src, norm))
-        if low.startswith("archive/"):
+        if "/character-presets/" in low or "/character presets/" in low:
+            kinds.add("preset")
+        elif low.startswith("archive/"):
             kinds.add("archive")
         elif low.startswith("mods/"):
             kinds.add("redmod")
@@ -844,7 +867,8 @@ def _move_files(rels, src_base, dst_base):
     return moved
 
 
-def install_archive(archive, install=None, enable=True, log=print, slug=None):
+def install_archive(archive, install=None, enable=True, log=print, slug=None,
+                    preset_gender=None):
     """Estrae un archivio e ne installa il contenuto. Ritorna lo slug, o None."""
     archive = os.path.expanduser(archive)
     if not os.path.isfile(archive):
@@ -860,12 +884,16 @@ def install_archive(archive, install=None, enable=True, log=print, slug=None):
     shutil.rmtree(tmp, ignore_errors=True)
     try:
         _extract_archive(archive, tmp)
-        pairs, ignored, kinds = plan_install(tmp, slug)
+        pairs, ignored, kinds = plan_install(tmp, slug, preset_gender)
         if not pairs:
-            raise RuntimeError(
-                "non riconosco la struttura di questo archivio: nessun .archive, "
-                "info.json,\n  .reds o cartella nota. Va installata a mano "
-                "(leggi la descrizione su Nexus)")
+            manca = ("non riconosco la struttura di questo archivio: nessun "
+                     ".archive, info.json,\n  .reds o cartella nota. Va "
+                     "installata a mano (leggi la descrizione su Nexus)")
+            if any(r.lower().endswith(".preset") for r in ignored):
+                manca = ("e' un preset ACU sciolto, senza il percorso dentro "
+                         "l'archivio: non so\n  se va fra i maschili o fra i "
+                         "femminili. Dimmelo: --preset male|female")
+            raise RuntimeError(manca)
         cfg, ns = cfg_load()
         entry = ns.setdefault("mods", {}).setdefault(slug, {})
         was = bool(entry.get("files"))
@@ -908,6 +936,10 @@ def install_archive(archive, install=None, enable=True, log=print, slug=None):
         log(f"  {'aggiornata' if was else 'installata'} {slug}: "
             f"{len(written)} file ({', '.join(kinds) or 'sconosciuto'})")
         if ignored:
+            if any(r.lower().endswith(".preset") for r in ignored):
+                log("  ! un .preset e' rimasto fuori: senza percorso "
+                    "nell'archivio serve\n    --preset male|female per sapere "
+                    "in quale ramo di ACU metterlo")
             log(f"  {len(ignored)} file non installati (fuori dalla struttura nota "
                 "o in cartelle protette):")
             for rel in ignored[:5]:
@@ -919,6 +951,14 @@ def install_archive(archive, install=None, enable=True, log=print, slug=None):
         if "redmod" in kinds:
             log("  ! REDmod: serve il flag -modded negli argomenti di avvio, "
                 "il deploy\n    lo fa REDprelauncher (vedi: pakrat cp2077 deploy)")
+        # qualche preset e' passato all'altro gestore (Character Preset
+        # Manager) e porta il suo percorso: si installa benissimo, ma ACU in
+        # quella cartella non guarda, e allo specchio non comparirebbe nulla
+        if any("character preset manager" in r.lower() for r in written):
+            log("  ! questo preset e' nel formato di Character Preset Manager, "
+                "non di ACU:\n    serve quella mod per vederlo (nexusmods.com/"
+                + NEXUS_GAME + "/mods/31886)")
+
         # meglio dirlo ora che lasciartelo scoprire da un gioco che non carica
         for f in missing_frameworks(written, install):
             log(f"  ! manca un prerequisito: {f} — {FRAMEWORKS[f]['why']}")
@@ -1281,8 +1321,8 @@ def cmd_setup(args):
 
 def cmd_add(args):
     if not args:
-        print("uso: pakrat cp2077 add ARCHIVIO.zip [...] [--no-enable] [--name NOME]",
-              file=sys.stderr)
+        print("uso: pakrat cp2077 add ARCHIVIO.zip [...] [--no-enable] "
+              "[--name NOME]\n     [--preset male|female]", file=sys.stderr)
         return 1
     install = resolve_install_dir()
     if not install:
@@ -1293,14 +1333,24 @@ def cmd_add(args):
         i = args.index("--name")
         if i + 1 < len(args):
             name = args[i + 1]
+    gender = None
+    if "--preset" in args:
+        i = args.index("--preset")
+        gender = args[i + 1].lower() if i + 1 < len(args) else ""
+        if gender not in ACU_GENDERS:
+            print(f"--preset vuole male o female, non {gender!r}", file=sys.stderr)
+            return 1
     skip = {"--name", name} if name else set()
+    if gender:
+        skip |= {"--preset", gender}
     files = [a for a in args if not a.startswith("--") and a not in skip]
     rc, done = 0, []
     for f in files:
         print(f"{os.path.basename(f)}:")
         try:
             got = install_archive(f, install, enable=enable,
-                                  slug=name if len(files) == 1 else None)
+                                  slug=name if len(files) == 1 else None,
+                                  preset_gender=gender)
         except Exception as ex:
             print(f"  errore: {ex}", file=sys.stderr)
             rc = 1
@@ -2050,7 +2100,8 @@ def cmd_search(args):
     return 0
 
 
-def fetch_and_install(mod_id, api_key, install, enable=True, file_id=None):
+def fetch_and_install(mod_id, api_key, install, enable=True, file_id=None,
+                      preset_gender=None):
     """Scarica una mod da Nexus e la installa. Ritorna (slug, errore).
 
     Estratto da 'get' perche' lo usa anche l'installazione di una catena di
@@ -2096,7 +2147,8 @@ def fetch_and_install(mod_id, api_key, install, enable=True, file_id=None):
             return None, f"download fallito: {ex}"
     try:
         slug = install_archive(archive, install, enable=enable,
-                               log=lambda s: print("  " + s.lstrip()))
+                               log=lambda s: print("  " + s.lstrip()),
+                               preset_gender=preset_gender)
     except Exception as ex:
         return None, str(ex)
     if not slug:
@@ -2788,7 +2840,396 @@ PRESETS = {
                 "guardaroba base ne' per quello delle DLC.",
     },
 }
-PRESET_ALIAS = {"1": "vtk", "2": "spawn0", "ramo1": "vtk", "ramo2": "spawn0"}
+PRESETS["acu"] = {
+    "titolo": "ACU — il volto: lo sblocco allo specchio e i preset piu' votati",
+    "base": 3850,
+    "volto": True,
+    "come": "Non c'entra col corpo e non litiga con nessuno dei due rami: ACU\n"
+            "sblocca allo specchio le voci che il gioco tiene chiuse e sa\n"
+            "caricare i preset di V fatti da altri. I preset arrivano dalla\n"
+            "loro categoria su Nexus, in ordine di endorsement.",
+}
+PRESET_ALIAS = {"1": "vtk", "2": "spawn0", "ramo1": "vtk", "ramo2": "spawn0",
+                "3": "acu", "ramo3": "acu", "volto": "acu"}
+
+# ------------------------------------------------------------ preset ACU ---
+# Qui non c'e' nessun elenco di ID cablati, e non e' pigrizia: i preset escono
+# a ritmo settimanale e una classifica scritta nel codice sarebbe gia' vecchia
+# al primo commit. La si chiede a Nexus, che quella classifica ce l'ha gia'.
+#
+# Il filtro giusto e' la CATEGORIA, non il tag: 'Character Preset' come tag sta
+# addosso a 1150 mod, per lo piu' trucchi per gli occhi e corpi degli NPC, e non
+# dice niente sul formato del file. La categoria dedicata sono meno di un
+# centinaio di mod ed e' esattamente cio' che cerchiamo.
+ACU_CATEGORIA = "Appearance Change Unlocker Preset"
+
+_FEM_RE = re.compile(r"\b(fem|fem ?v|femv|female|girl|woman|women|she|her|hers|"
+                     r"body ?type ?2|bt2)\b", re.I)
+_MASC_RE = re.compile(r"(?<!fe)\bmale\b|\b(man|guy|boy|his|masc|"
+                      r"body ?type ?1|bt1)\b", re.I)
+
+
+def _gender_of(nome, sommario):
+    """'male' | 'female' | None, dedotto dalla pagina Nexus.
+
+    Serve a due cose diverse. Dividere la classifica nei due rami, dove un
+    errore si vede e si corregge; e decidere dove va un .preset sciolto, dove
+    invece un errore e' silenzioso — il file finisce in una cartella che ACU
+    per quel corpo non guarda, e nel menu non compare niente. Per questo None
+    e' una risposta legittima e non un fallimento: chi la riceve si ferma e
+    chiede, invece di tirare a indovinare.
+    """
+    t = f"{nome or ''} {sommario or ''}"
+    fem, masc = _FEM_RE.search(t), _MASC_RE.search(t)
+    if fem and masc:
+        return "female" if fem.start() <= masc.start() else "male"
+    return "female" if fem else ("male" if masc else None)
+
+
+def acu_presets(api_key, count=60):
+    """La classifica dei preset ACU, la piu' votata per prima. Una richiesta."""
+    q = ("query($f:ModsFilter,$c:Int,$s:[ModsSort!]){mods(filter:$f,count:$c,"
+         "sort:$s,viewUserBlockedContent:true){nodes{modId name endorsements "
+         "adultContent summary}}}")
+    f = {"gameDomainName": [{"value": NEXUS_GAME, "op": "EQUALS"}],
+         "categoryName": [{"value": ACU_CATEGORIA, "op": "EQUALS"}]}
+    d = core().nexus_graphql(
+        q, {"f": f, "c": count, "s": [{"endorsements": {"direction": "DESC"}}]},
+        api_key)
+    out = []
+    for n in (d.get("mods", {}).get("nodes") or []):
+        out.append({"id": int(n["modId"]),
+                    "nome": str(n.get("name") or ""),
+                    "voti": int(n.get("endorsements") or 0),
+                    "adulti": bool(n.get("adultContent")),
+                    "sesso": _gender_of(n.get("name"), n.get("summary"))})
+    return out
+
+
+def _acu_scelta(args, api_key):
+    """I preset da installare: i piu' votati di ciascun ramo, gia' filtrati."""
+    quanti = 10
+    if "--quanti" in args:
+        i = args.index("--quanti")
+        v = args[i + 1] if i + 1 < len(args) else ""
+        if not v.isdigit() or int(v) < 1:
+            print(f"--quanti vuole un numero, non {v!r}", file=sys.stderr)
+            return None
+        quanti = int(v)
+    tutti = acu_presets(api_key)
+    if "--salta" in args:
+        i = args.index("--salta")
+        v = args[i + 1] if i + 1 < len(args) else ""
+        fuori = {x.strip() for x in v.replace(",", " ").split() if x.strip()}
+        if not fuori or not all(x.isdigit() for x in fuori):
+            print(f"--salta vuole uno o piu' ID Nexus, non {v!r}", file=sys.stderr)
+            return None
+        fuori = {int(x) for x in fuori}
+        # il buco si richiude: togliere un preset fa entrare l'undicesimo, che
+        # e' quasi sempre cio' che si vuole quando si dice "questo no"
+        tutti = [p for p in tutti if p["id"] not in fuori]
+    if "--senza-adulti" in args:
+        tutti = [p for p in tutti if not p["adulti"]]
+    rami = [r for r in ("female", "male")
+            if f"--{'femminili' if r == 'female' else 'maschili'}" in args]
+    if not rami:
+        rami = ["female", "male"]
+    if "--frontiera" in args:
+        # niente taglio in classifica: il campione e' tutta la categoria, e a
+        # scegliere e' il costo
+        return [(r, [p for p in tutti if p["sesso"] == r
+                     or (r == "female" and p["sesso"] is None)], 0)
+                for r in rami]
+    scelti = []
+    for r in rami:
+        # i non classificati finiscono fra i femminili solo per la classifica:
+        # sono 56 su 59, e chiedere il sesso di un preset che porta gia' il suo
+        # percorso dentro l'archivio sarebbe una domanda inutile
+        pool = [p for p in tutti if p["sesso"] == r
+                or (r == "female" and p["sesso"] is None)]
+        scelti.append((r, pool[:quanti], len(pool)))
+    return scelti
+
+
+# Un corpo non e' un prerequisito come gli altri: due corpi che rifanno la
+# stessa mesh non convivono, e i preset piu' curati ne pretendono uno a testa —
+# fra i primi dieci ci sono VTK, PUSH UP, -KS- Atlas ed EKT ThiccV, che insieme
+# non possono stare. BODIES copre quelli che il comando 'body' conosce; il resto
+# lo si riconosce dal nome, che per questa famiglia di mod e' esplicito.
+_BODY_RE = re.compile(r"\bbody (mod|rig|replacer)\b|\bplayer body\b", re.I)
+
+
+def _is_body(mod_id, nome):
+    return bool(_body_by_id(mod_id)) or bool(_BODY_RE.search(nome or ""))
+
+
+def _acu_requisiti(scelti, api_key, install, gia_in_piano=(), tetto=5,
+                   ordina="voti"):
+    """I prerequisiti dei preset, uniti, e i preset che costano troppo.
+
+    Ritorna (ids, note, corpi, tenuti, scartati).
+
+    Un preset non e' autosufficiente: la faccia che vedi nello screenshot e'
+    fatta anche di capelli, occhi, trucco e complexion che stanno in altre mod,
+    e senza quelle il preset carica lo stesso ma somiglia a un'altra persona.
+    L'elenco e' quello che l'autore dichiara nella tabella Requirements — la
+    stessa fonte che gia' usiamo per i refit dei corpi.
+
+    I corpi vengono tolti dal piano e restituiti a parte: si escludono a
+    vicenda, e sceglierne uno e' una decisione da prendere una volta per tutte
+    con 'preset 1|2', non un effetto collaterale di dieci facce installate.
+
+    Il 'tetto' e' il freno, e misura il costo MARGINALE: quante mod porta un
+    preset che nessuno dei precedenti aveva gia' chiesto. E' la misura giusta
+    perche' i preset non sono indipendenti — si appoggiano quasi tutti allo
+    stesso giro di mod per capelli e pelle, e chi ci si appoggia non costa
+    niente. tetto=0 toglie il freno.
+
+    'ordina' decide in che ordine si paga, e cambia tutto:
+
+      voti   li prende come stanno in classifica, il piu' votato per primo.
+             Il primo di ogni ramo e' esente dal tetto: qualcuno l'ingresso lo
+             deve pagare, e tanto vale che sia il piu' votato.
+      costo  li prende dal piu' economico, a parita' il piu' votato. Nessuna
+             esenzione, perche' non serve: i preset che non chiedono niente
+             esistono e vengono per primi. E' l'ordine che massimizza le facce
+             per mod installata.
+    """
+    have = _installed_nexus_ids()
+    visti = set(gia_in_piano)
+
+    # prima si legge, poi si sceglie: il costo marginale di un preset dipende
+    # da quali altri sono gia' entrati, e non lo si puo' valutare leggendo una
+    # pagina per volta
+    cand = []
+    for p, ramo in scelti:
+        try:
+            reqs = requirements(p["id"], api_key, install)
+        except Exception as ex:
+            print(f"  requisiti di {p['nome']}: {ex}", file=sys.stderr)
+            cand.append((p, ramo, set(), {}, []))
+            continue
+        suoi, note_p, corpi_p = set(), {}, []
+        for rid, cl, nm, nota, _fonte in reqs:
+            if cl != "richiesto" or rid == p["id"]:
+                continue
+            nome = nm or mod_name(rid, api_key)
+            if _is_body(rid, nome):
+                corpi_p.append((rid, nome))
+            elif rid not in visti and not skip_reason(rid, api_key, install, have):
+                suoi.add(rid)
+                note_p[rid] = (nome, nota)
+        cand.append((p, ramo, suoi, note_p, corpi_p))
+
+    ids, note, corpi, tenuti, scartati = [], {}, {}, [], []
+    paid, primo = set(), set()
+    resto = list(cand)
+    while resto:
+        if ordina == "costo":
+            voce = min(resto, key=lambda c: (len(c[2] - paid), -c[0]["voti"]))
+        else:
+            voce = resto[0]
+        resto.remove(voce)
+        p, ramo, suoi, note_p, corpi_p = voce
+        nuovi = suoi - paid
+        esente = ordina == "voti" and ramo not in primo
+        if tetto and not esente and len(nuovi) > tetto:
+            scartati.append((p, ramo, len(nuovi)))
+            continue
+        primo.add(ramo)
+        tenuti.append((p, ramo))
+        paid |= suoi
+        for rid in suoi:
+            if rid not in ids:
+                ids.append(rid)
+                note[rid] = note_p[rid]
+            elif note_p[rid][1] and not note[rid][1]:
+                note[rid] = (note[rid][0], note_p[rid][1])
+        for rid, nome in corpi_p:
+            corpi.setdefault(rid, (nome, []))[1].append(p["nome"])
+    if ordina == "costo":
+        tenuti.sort(key=lambda t: -t[0]["voti"])
+    return ids, note, corpi, tenuti, scartati
+
+
+def _preset_acu(args, api_key, install):
+    """ACU piu' i preset piu' votati. Ogni preset resta una mod a se': si
+    disinstalla da solo, senza portarsi dietro gli altri."""
+    scelta = _acu_scelta(args, api_key)
+    if scelta is None:
+        return 1
+    print("\nrisolvo le dipendenze di ACU:\n")
+    plan = expand_reqs([PRESETS["acu"]["base"]], api_key, install)
+    if plan:
+        print("\ninstallerei prima, in quest'ordine:")
+        for i in plan:
+            print(f"  {i:>6}  {mod_name(i, api_key)[:56]}")
+    else:
+        print("  ACU e i suoi prerequisiti sono gia' qui.")
+    frontiera = "--frontiera" in args
+    if frontiera and "--senza-requisiti" in args:
+        print("--frontiera sceglie in base ai requisiti: con --senza-requisiti "
+              "non ha\nniente su cui decidere. Usane uno solo.", file=sys.stderr)
+        return 1
+    totale = []
+    for ramo, ps, disponibili in scelta:
+        eti = "femminili" if ramo == "female" else "maschili"
+        if not ps:
+            print(f"\npreset {eti}: nessuno in categoria.")
+            continue
+        if frontiera:
+            print(f"\npreset {eti} in categoria: {len(ps)}")
+        else:
+            print(f"\npreset {eti} piu' votati ({len(ps)} di {disponibili} "
+                  f"in categoria):")
+            for p in ps:
+                mark = " [18+]" if p["adulti"] else ""
+                print(f"  {p['id']:>6}  {p['voti']:>5} voti  "
+                      f"{p['nome'][:44]}{mark}")
+        totale += [(p, ramo) for p in ps]
+    if not totale:
+        print("\nniente da installare.")
+        return 0
+
+    req, note, corpi, scartati = [], {}, {}, []
+    if "--senza-requisiti" not in args:
+        # ordinando per costo il tetto non e' piu' un freno agli esotici ma il
+        # criterio di arresto, e i valori sensati sono piccoli: a 2 si prendono
+        # 30 facce con 14 mod, a 3 ne servono 33 per prenderne 37
+        tetto = 2 if frontiera else 5
+        if "--max-requisiti" in args:
+            i = args.index("--max-requisiti")
+            v = args[i + 1] if i + 1 < len(args) else ""
+            if not v.isdigit():
+                print(f"--max-requisiti vuole un numero, non {v!r}",
+                      file=sys.stderr)
+                return 1
+            tetto = int(v)
+        print(f"\nleggo i requisiti dichiarati dai preset "
+              f"({len(totale)} pagine, una per preset):")
+        req, note, corpi, totale, scartati = _acu_requisiti(
+            totale, api_key, install, plan, tetto,
+            "costo" if frontiera else "voti")
+        if frontiera:
+            print(f"\ntengo {len(totale)} facce, che insieme chiedono "
+                  f"{len(req)} mod:\n")
+            for p2, _ramo in totale:
+                mark = " [18+]" if p2["adulti"] else ""
+                print(f"  {p2['id']:>6}  {p2['voti']:>5} voti  "
+                      f"{p2['nome'][:44]}{mark}")
+        if scartati:
+            print(f"\nne lascio indietro {len(scartati)}: ognuno porta piu' di "
+                  f"{tetto} mod che\nnessun altro preset chiede. "
+                  "--max-requisiti N alza il tetto, 0 lo toglie.\n")
+            for p2, _ramo, quante in scartati[:8]:
+                print(f"  {p2['id']:>6}  {p2['nome'][:44]:<44} +{quante} mod")
+            if len(scartati) > 8:
+                print(f"  ... e altri {len(scartati) - 8}")
+        if not totale:
+            print("\nnessun preset sopravvive al tetto: alzalo con "
+                  "--max-requisiti N.")
+            return 0
+        if req:
+            print(f"\n{'serve' if len(req) == 1 else 'servono'} anche "
+                  f"{len(req)} mod — capelli, occhi, trucco, complexion:\n"
+                  "senza, il preset carica lo stesso ma la faccia non e' "
+                  "quella dello screenshot.\n")
+            for rid in req:
+                nome, nota = note[rid]
+                print(f"  {rid:>6}  {nome[:52]}")
+                if nota:
+                    # l'autore spesso indica QUALE file scaricare fra i tanti
+                    # della pagina, e noi prendiamo sempre il principale
+                    print(f"          l'autore dice: {nota[:58]}")
+        else:
+            print("  nessun requisito nuovo: c'e' gia' tutto.")
+        if corpi:
+            print("\n" + (f"{len(corpi)} corpi chiesti dai preset, che NON "
+                           "installo: si escludono a vicenda"
+                           if len(corpi) > 1 else
+                           "un corpo chiesto dai preset, che NON installo")
+                  + "\ne il corpo si sceglie una volta sola, con "
+                    "'pakrat cp2077 preset 1|2'.\n")
+            for rid, (nome, chi) in corpi.items():
+                print(f"  {rid:>6}  {nome[:52]}")
+                print(f"          per: {', '.join(c[:24] for c in chi[:3])}")
+    if "--dry-run" in args:
+        print("\n(--dry-run: non ho scaricato niente)")
+        return 0
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("\nda script non installo senza conferma: rilancia da terminale.")
+        return 0
+    if not require_game_closed():
+        return 1
+    quante = len(plan) + len(req) + len(totale)
+    try:
+        r = input(f"\nprocedo? {quante} mod in tutto "
+                  f"({len(totale)} preset, {len(req)} requisiti) [s/N]: "
+                  ).strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 0
+    if r not in ("s", "si", "sì", "y", "yes"):
+        print("ok, non faccio niente.")
+        return 0
+    rc, done = 0, []
+    for i in plan:
+        slug, err = fetch_and_install(i, api_key, install, enable=True)
+        if err:
+            print(f"  {err}", file=sys.stderr)
+            return 1              # senza ACU i preset non li legge nessuno
+        done.append(slug)
+    for i in req:
+        slug, err = fetch_and_install(i, api_key, install, enable=True)
+        if err:
+            # un requisito mancante rovina una faccia, non l'installazione:
+            # gli altri preset hanno ancora senso
+            print(f"  {err}", file=sys.stderr)
+            rc = 1
+        else:
+            done.append(slug)
+    for p, ramo in totale:
+        slug, err = _install_preset(p, ramo, api_key, install)
+        if err:
+            print(f"  {err}", file=sys.stderr)
+            rc = 1
+        else:
+            done.append(slug)
+    if done:
+        print(f"\n{len(done)} voci installate. Elenco: pakrat cp2077 list")
+        print("I preset si scelgono allo specchio dell'appartamento, dalla\n"
+              "tendina che ACU aggiunge in alto a sinistra.")
+        if corpi:
+            print("Restano fuori i corpi: 'pakrat cp2077 preset 1|2'.")
+        _cfg, ns = cfg_load()
+        fw = sorted({x for s2 in done for x in missing_frameworks(
+            (ns.get("mods") or {}).get(s2, {}).get("files") or [], install)})
+        offer_bootstrap(fw, install)
+    return rc
+
+
+def _install_preset(p, ramo, api_key, install):
+    """Un preset, nel ramo giusto. Se l'archivio e' un .preset nudo e la pagina
+    non diceva il sesso, l'installazione si ferma: allora lo chiediamo, invece
+    di scriverlo in una cartella dove ACU non lo cerchera' mai."""
+    slug, err = fetch_and_install(p["id"], api_key, install, enable=True,
+                                  preset_gender=p["sesso"])
+    if err and "--preset male|female" in err and sys.stdin.isatty():
+        print(f"  {p['nome']}: la pagina non dice se e' per V maschile o "
+              "femminile,\n  e l'archivio non porta il percorso.")
+        try:
+            r = input("  quale corpo? [f/m, invio per saltare]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None, "saltato"
+        if r.startswith("f") or r.startswith("m"):
+            # l'archivio e' gia' in cache: il secondo tentativo non riscarica
+            return fetch_and_install(p["id"], api_key, install, enable=True,
+                                     preset_gender="female" if r[0] == "f"
+                                     else "male")
+        return None, f"{p['nome']}: saltato"
+    return slug, err
+
 
 
 def _body_by_id(mod_id):
@@ -2832,8 +3273,10 @@ def cmd_preset(args):
     refs = [a for a in args if not a.startswith("-")]
     if not refs:
         stats = download_counts()
-        print("i due rami possibili. Non si mescolano: scegline uno.\n")
+        print("il corpo: due rami, e non si mescolano. Scegline uno.\n")
         for k, p in PRESETS.items():
+            if p.get("volto"):
+                continue
             b = _body_by_id(p["base"]) or {}
             uniq = stats.get(p["base"], (0, 0))[1]
             n = "1" if k == "vtk" else "2"
@@ -2845,19 +3288,33 @@ def cmd_preset(args):
                 print(f"      {len(p['varianti'])} varianti di silhouette fra cui "
                       "scegliere")
             print()
+        a = PRESETS["acu"]
+        print("il volto: sta di fianco, non al posto. Si puo' avere insieme a "
+              "uno dei due.\n")
+        print(f"  ramo 3 (acu) — {a['titolo']}")
+        for riga in _wrap(a["come"].replace("\n", " "), 68):
+            print(f"      {riga}")
+        print()
         print("uso:  pakrat cp2077 preset 1 [--variante N]\n"
               "      pakrat cp2077 preset 2\n"
+              "      pakrat cp2077 preset 3 [--quanti N] [--senza-adulti]\n"
+              "                             [--femminili|--maschili]\n"
+              "                             [--senza-requisiti|--max-requisiti N]\n"
+              "                             [--salta ID[,ID]] [--frontiera]\n"
               "      --dry-run per vedere cosa installerebbe, senza farlo")
         return 0
 
     key = PRESET_ALIAS.get(refs[0].lower(), refs[0].lower())
     p = PRESETS.get(key)
     if p is None:
-        print(f"ramo sconosciuto: {refs[0]} (sono 1/vtk e 2/spawn0)", file=sys.stderr)
+        print(f"ramo sconosciuto: {refs[0]} (sono 1/vtk, 2/spawn0 e 3/acu)",
+              file=sys.stderr)
         return 1
     print(p["titolo"] + "\n")
     for riga in _wrap(p["come"].replace("\n", " "), 72):
         print(riga)
+    if p.get("volto"):
+        return _preset_acu(args, api_key, install)
 
     seeds = [p["base"]]
     if key == "vtk":
@@ -3185,6 +3642,7 @@ HELP = """pakrat cp2077 - Cyberpunk 2077
   add ARCHIVIO [...]    installa da zip/7z/rar
                         --no-enable installa senza attivare
                         --name NOME forza il nome della mod
+                        --preset male|female per un .preset ACU sciolto
   enable MOD [...]      attiva (rimette i file in gioco)
   disable MOD [...]     disattiva (sposta i file nel deposito)
   order MOD N           prefisso NNN_ sugli .archive ('-' per toglierlo)
@@ -3206,9 +3664,19 @@ HELP = """pakrat cp2077 - Cyberpunk 2077
   reqs ID               cosa pretende una mod, dedotto dalla pagina Nexus
   body [N|ID]           elenca i corpi opzionali, o ne installa uno con la
                         sua catena (--dry-run mostra e basta)
-  preset [1|2]          installa un ramo intero: corpo, prerequisiti e refit
+  preset [1|2|3]        1 e 2 installano un corpo intero: prerequisiti e refit
                         dei vestiti (base e DLC). --variante N sceglie la
                         silhouette, --dry-run mostra e basta
+                        3 e' il volto: ACU, i preset di V piu' votati su Nexus
+                        e le mod che i preset pretendono (capelli, occhi,
+                        trucco). --quanti N per ramo (10), --femminili/
+                        --maschili restringe, --senza-adulti salta i contenuti
+                        adulti, --senza-requisiti installa i soli preset,
+                        --max-requisiti N (5) scarta i preset che portano piu'
+                        di N mod che nessun altro chiede, --salta ID[,ID] ne
+                        toglie di preciso e lascia entrare i successivi.
+                        --frontiera ignora la classifica e prende dall'intera
+                        categoria le facce che costano meno mod
   link MOD ID           associa una mod alla sua pagina Nexus
   check                 cerca aggiornamenti su Nexus
   update [MOD]          scarica e installa gli aggiornamenti

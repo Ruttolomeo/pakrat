@@ -476,7 +476,7 @@ preso dal feed statistico pubblico di Nexus (una richiesta, nessuna chiave, ness
 quota consumata) e non da una tabella che invecchia — e installando ne risolve la
 catena, avvisando se un altro corpo per lo stesso personaggio e' gia' li'.
 
-**`pakrat cp2077 preset 1|2`** installa un ramo intero. Un preset qui non e' un
+**`pakrat cp2077 preset 1|2|3`** installa un ramo intero. Un preset qui non e' un
 pacchetto ma un **punto di partenza**: due o tre ID da cui far partire la
 risoluzione delle dipendenze descritta sopra. I refit dei vestiti percio' non
 sono elencati nel codice — li dichiara l'autore del corpo nella sua tabella
@@ -484,6 +484,7 @@ Requirements, ed e' l'unico posto dove restano aggiornati quando la mod cambia.
 
     ramo 1 (vtk)     mesh nuova + la silhouette che scegli fra quattro
     ramo 2 (spawn0)  proporzioni regolabili in gioco, mesh intatta
+    ramo 3 (acu)     il volto: ACU + i preset di V piu' votati su Nexus
 
 Sul ramo 1 il preset chiede quale variante (o `--variante N`), e tira dentro il
 suo pacchetto di refit per il guardaroba base **e** quello di Phantom Liberty,
@@ -502,6 +503,160 @@ Con esso il comando dichiara la cosa che conta davvero e che nessuna automazione
 risolve — un corpo *sculpt* rifa' la mesh, quindi i **vestiti** vanno rifatti su
 quella forma, e i refit sono mod a parte, una per outfit. Un corpo *rig* cambia le
 proporzioni dello scheletro e non ne ha bisogno.
+
+**Il ramo 3 e' di un'altra natura**, e per questo non si esclude con gli altri
+due: il corpo lo decidi una volta, il volto lo cambi allo specchio. ACU
+(*Appearance Change Unlocker*) sblocca le voci che il gioco tiene chiuse fuori
+dal ripperdoc e sa caricare i **preset** di V pubblicati da altri.
+
+Dei preset **non c'e' nessun elenco nel codice**, ed e' una scelta: ne escono di
+nuovi ogni settimana, e una classifica cablata sarebbe vecchia al primo commit.
+La si chiede a Nexus ordinata per endorsement — una richiesta GraphQL — e si
+prende la testa. Il filtro e' la **categoria** dedicata, non il tag: `Character
+Preset` come tag sta addosso a piu' di mille mod, per lo piu' trucchi per gli
+occhi e corpi degli NPC, e non dice niente sul formato del file; la categoria
+sono meno di un centinaio di pagine, e sono quelle giuste.
+
+    pakrat cp2077 preset 3 --dry-run          # la classifica, senza scaricare
+    pakrat cp2077 preset 3 --quanti 10        # i primi 10 per ramo (default)
+    pakrat cp2077 preset 3 --maschili         # solo uno dei due
+    pakrat cp2077 preset 3 --senza-adulti     # salta i contenuti adulti
+    pakrat cp2077 preset 3 --senza-requisiti  # i soli file di preset
+    pakrat cp2077 preset 3 --max-requisiti 0  # tieni tutto, anche gli esotici
+    pakrat cp2077 preset 3 --salta 23723      # questo no, e avanti il prossimo
+    pakrat cp2077 preset 3 --frontiera        # piu' facce possibili, meno mod
+
+I due rami qui sono i **sessi**, e non sono simmetrici: al momento la categoria
+ha 56 preset femminili e **3** maschili, quindi `--quanti 10` ne installa 10 e 3.
+Il comando lo dice invece di far finta che il numero chiesto sia stato servito.
+
+**Un preset da solo non basta**, ed e' il motivo per cui il comando non si
+ferma ai file di aspetto. La faccia dello screenshot e' fatta anche di capelli,
+occhi, trucco e complexion che stanno in altre mod: senza quelle il preset
+carica lo stesso — i cursori sono suoi — ma dove doveva esserci un taglio
+particolare c'e' un taglio vanilla, e il risultato somiglia a un'altra persona.
+L'elenco lo dichiara l'autore nella tabella Requirements, la stessa fonte da cui
+prendiamo i refit dei corpi, e il comando lo legge per ogni preset scelto, lo
+unisce e lo installa prima. `--senza-requisiti` se vuoi solo i file.
+
+**Presi tutti e tredici sarebbero pero' 42 mod**, ed e' troppo per delle facce.
+La via d'uscita non e' installare i prerequisiti *piu' diffusi* e lasciare
+indietro gli altri: darebbe tredici preset ognuno sbagliato per conto suo, che e'
+il risultato peggiore possibile. Meglio **togliere qualche preset e tenere interi
+quelli che restano**, ed e' quello che fa `--max-requisiti` (default 5).
+
+Il conto e' sul costo **marginale**: quante mod porta un preset che nessuno dei
+precedenti aveva gia' chiesto. E' la misura giusta perche' i preset non sono
+indipendenti — si appoggiano quasi tutti allo stesso giro di mod per capelli e
+pelle — e sui primi dieci la differenza e' netta:
+
+    Hannah      +8   (il primo paga l'ingresso)
+    Vitoria     +0   riusa tutto quello di Hannah
+    BellaV2     +2
+    AshV2       +0
+    Cute        +1
+    Mariko      +1
+    WOLF        +9   <- lipstick, eyeliner, cybersigilismo, wolfcut...
+    Dreaded     +6   <-
+    Chika       +1
+    Valerie     +1
+
+Due preset costano **zero**, sei ne portano una o due, e tre da soli ne
+trascinano ventiquattro. Quei tre non sono piu' belli degli altri, sono piu'
+esotici. Scartandoli si passa da **42 mod a 18** perdendo 4 preset su 13, e
+stringere ancora non conviene: a tetto 2 se ne perde un altro per risparmiare
+tre mod. Il primo preset tenuto di ogni ramo e' esente dal tetto — qualcuno
+l'ingresso lo deve pagare, e tanto vale che sia il piu' votato.
+
+Il conto e' rifatto man mano, non calcolato una volta sola: Havi da solo costa
++2 se Another Corpo V c'e' gia', +7 se e' stato scartato. Le due cifre le vedi
+cambiare alzando il tetto.
+
+**`--frontiera` ribalta il criterio**, e vale la pena capire perche' conviene.
+Fin qui l'ordine e' la classifica: si parte dal piu' votato e si paga quel che
+chiede. Ma le facce non costano tutte uguale, e la classifica non lo sa: e' un
+ordine per popolarita' applicato a un problema di copertura. Con `--frontiera`
+il campione diventa **l'intera categoria** invece dei primi N, e a decidere e'
+il costo marginale — la piu' economica per prima, a parita' la piu' votata.
+
+Il risultato non e' un compromesso, e' meglio su entrambi gli assi:
+
+    classifica, tetto 5     9 facce, 18 mod
+    frontiera,  tetto 2    30 facce, 14 mod
+
+Il motivo e' che **17 preset su 59 non chiedono niente** — sono fatti coi
+cursori e basta, o al massimo con roba che hai gia' — e la classifica non li
+vedeva perche' stanno sotto il taglio dei primi dieci. Fra questi c'e' Vitoria,
+che di voti ne ha 386 ed e' la seconda della categoria. Da li' in poi si sale
+di un mod per volta.
+
+In questa modalita' il tetto non e' piu' un freno agli esotici ma il **criterio
+di arresto**, e i valori sensati sono piccoli (default 2):
+
+    tetto 0    17 facce,   0 mod    solo quelle che non chiedono niente
+    tetto 1    28 facce,  10 mod
+    tetto 2    30 facce,  14 mod    <- il ginocchio
+    tetto 3    37 facce,  33 mod    +7 facce, ma +19 mod
+    tetto 5    50 facce,  94 mod
+
+Il prezzo da pagare c'e' e va detto: ordinando per costo si perdono le facce
+piu' famose. Hannah (491 voti) chiede otto mod sue e resta fuori, come BellaV2
+e AshV2. Si prendono trenta facce meno note al prezzo di quattordici mod, o si
+prende Hannah al prezzo di otto: sono due domande diverse, e `--frontiera`
+risponde alla prima. Le due modalita' si combinano con tutto il resto —
+`--maschili`, `--senza-adulti`, `--salta` — e `--quanti` in frontiera non serve,
+perche' il campione e' gia' tutta la categoria.
+
+`--salta ID` toglie un preset di preciso, e **il buco si richiude**: se ne
+scarti uno dei dieci entra l'undicesimo. Quasi sempre e' cio' che si vuole, ma
+va detto che il ricambio puo' costare piu' di cio' che hai tolto — togliendo
+WOLF (+9) entra Viper, che da solo ne porta **+15**, e senza tetto il totale
+sale da 42 a 48. Col tetto attivo il problema non si pone: Viper viene scartato
+appena entra, e il risultato non cambia di una virgola. E' un buon motivo per
+non alzare il tetto solo perche' si e' tolto qualcosa a mano.
+
+Dove la tabella e' vuota si ripiega sulla descrizione, con la solita euristica —
+e li' si vede la differenza fra le due fonti: la tabella di WOLF elenca tredici
+requisiti puliti, la descrizione di AshV2 ne produce trenta di cui solo quattro
+sono davvero *richiesti* e il resto sono link citati di passaggio, che infatti
+non si installano.
+
+Quando la nota dell'autore dice **quale** file scaricare fra i tanti di una
+pagina ("Sweaty 50%", "Bella Hair", "Beautiful Eyebrows - 02") la stampiamo
+accanto al requisito, perche' pakrat prende sempre il file principale e quella
+scelta li' resta tua.
+
+**I corpi sono l'eccezione, e restano fuori.** Fra i primi dieci preset ci sono
+mod che pretendono VTK, PUSH UP, EKT ThiccV e `-KS-` Atlas: sono corpi, si
+escludono a vicenda, e installarli tutti perche' dieci facce li chiedono
+significherebbe rompere esattamente cio' che i rami 1 e 2 tengono in ordine. Il
+comando li elenca a parte, dice quale preset li voleva, e rimanda a `preset 1|2`.
+Il riconoscimento non poteva essere la sola tabella `BODIES` — Atlas e ThiccV non
+ci sono dentro — e si appoggia anche al nome, che per questa famiglia di mod e'
+esplicito ("a male player body mod", "body Rig").
+
+La divisione non e' cosmetica. ACU tiene i preset in due cartelle,
+`character-presets/male` e `character-presets/female`, e allo specchio mostra
+**solo** quella che corrisponde al corpo di V: un preset finito nel ramo
+sbagliato non e' mal messo, e' invisibile. Quasi tutti gli archivi il percorso
+completo ce l'hanno dentro e allora decide l'autore; una minoranza e' un
+`.preset` **nudo**, e li' il ramo lo dobbiamo scegliere noi. Lo si deduce dalla
+pagina Nexus, e quando la pagina non lo dice — succede: un preset di nome
+"Chika" non dichiara niente — pakrat **si ferma e chiede**, invece di tirare a
+indovinare e lasciarti un file che non comparira' mai. Fuori dal preset la
+stessa cosa si fa a mano:
+
+    pakrat cp2077 add "Havi.preset.rar" --preset male
+
+Un preset resta comunque una **mod a se'** nel manifest: si toglie da solo con
+`remove`, senza portarsi dietro ACU ne' gli altri. Nel `list` compare come tipo
+`preset` e non come `script`, che per un file di aspetto non voleva dire niente.
+
+Una nota sul formato: qualche autore e' passato al gestore concorrente
+(*Character Preset Manager*), e il suo archivio punta a un'altra cartella.
+Si installa lo stesso — il percorso ce l'ha dentro — ma ACU li' non guarda, e
+pakrat lo dice a installazione fatta invece di lasciartelo scoprire allo
+specchio.
 
 **REDmod**: pakrat prepara `mods/` ma **non lancia `redMod.exe deploy`**, che e' un
 eseguibile Windows — questo tool non dipende da Wine e non e' il caso di iniziare
