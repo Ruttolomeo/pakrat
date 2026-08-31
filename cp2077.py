@@ -2077,7 +2077,9 @@ def cmd_search(args):
     _cfg, ns = cfg_load()
     known = {}
     for slug, e in (ns.get("mods") or {}).items():
-        if e.get("nexus_id"):
+        # una mod rimossa non e' installata: segnarla tale manderebbe a cercare
+        # altrove qualcosa che invece si puo' rimettere (restore) o riscaricare
+        if e.get("nexus_id") and not e.get("removed_at"):
             known[int(e["nexus_id"])] = slug
     if len(tried) > 1:
         print(f"(nessun risultato per '{term}', ho cercato: "
