@@ -2515,6 +2515,12 @@ def _installed_nexus_ids(ns=None, attive_solo=False):
     'enable'. Restano quindi contate per default. attive_solo=True le esclude,
     ed e' quello che serve a chi ragiona su cosa il gioco CARICA — un corpo
     disattivato non entra in conflitto con nessuno.
+
+    Il valore e' una LISTA di slug, non uno: una pagina Nexus puo' avere piu'
+    file installati, ognuno una mod per noi (la pagina VTK 7054 e' insieme il
+    corpo, la testa e due pacchetti di texture). Tenendone uno solo vinceva
+    l'ultimo del giro, e chi chiedeva "questa mod e' spenta?" si sentiva
+    rispondere per un file che non era quello che aveva in mente.
     """
     if ns is None:
         _cfg, ns = cfg_load()
@@ -2524,18 +2530,33 @@ def _installed_nexus_ids(ns=None, attive_solo=False):
             continue
         if attive_solo and not e.get("enabled", True):
             continue
-        out[int(e["nexus_id"])] = slug
+        out.setdefault(int(e["nexus_id"]), []).append(slug)
     return out
 
 
-def _disattivata(mod_id, have, ns=None):
-    """True se quella mod c'e' ma e' in deposito: da riaccendere, non da ripescare."""
-    slug = have.get(int(mod_id))
-    if not slug:
-        return False
+def _slug_stati(mod_id, have, ns=None):
+    """(attivi, in deposito): gli slug installati da quella pagina Nexus."""
+    slugs = have.get(int(mod_id)) or []
+    if not slugs:
+        return [], []
     if ns is None:
         _cfg, ns = cfg_load()
-    return not (ns.get("mods") or {}).get(slug, {}).get("enabled", True)
+    mods = ns.get("mods") or {}
+    on = [s for s in slugs if mods.get(s, {}).get("enabled", True)]
+    off = [s for s in slugs if not mods.get(s, {}).get("enabled", True)]
+    return on, off
+
+
+def _disattivata(mod_id, have, ns=None):
+    """True se quella mod c'e' ma e' TUTTA in deposito: da riaccendere, non da
+    ripescare.
+
+    'Tutta' perche' di una pagina con piu' file basta che uno sia attivo perche'
+    in gioco quella mod ci sia: dirla disattivata mentre carica manda a
+    riaccendere qualcosa che e' gia' acceso.
+    """
+    on, off = _slug_stati(mod_id, have, ns)
+    return bool(off) and not on
 
 
 def _framework_by_name(nome):
@@ -2575,8 +2596,15 @@ def skip_reason(mod_id, api_key, install, have):
         # presente ma spenta: i file ci sono, riscaricarla non serve a niente.
         # Va detto, perche' altrimenti la si conta come a posto e in gioco non
         # carica.
-        if _disattivata(mod_id, have):
+        on, off = _slug_stati(mod_id, have)
+        if not on:
             return "presente ma DISATTIVATA: serve 'enable', non un download"
+        if off:
+            # meta' pagina in gioco e meta' in deposito. Non si puo' sapere
+            # quale file l'autore intendesse — un requisito e' una pagina, non
+            # un file — quindi non si scarica niente e si dice come sta.
+            return ("gia' installata, ma " + str(len(off)) + " file di quella "
+                    "pagina in deposito: " + ", ".join(sorted(off)))
         return "gia' installata"
     nome = mod_name(mod_id, api_key)
     if _is_tool(nome):
@@ -2692,7 +2720,7 @@ def cmd_reqs(args):
         if classe == "citato" and shown >= 6:
             continue
         shown += 1 if classe == "citato" else 0
-        mark = "gia' installata" if i in have else ""
+        mark = skip_reason(i, api_key, install, have) if i != mod_id else ""
         print(f"  [{classe:<12}] {i:>6}  {(nome or mod_name(i, api_key))[:42]:<42} {mark}")
         if nota:
             print(f"                 \"{nota[:92]}\"")
@@ -2931,9 +2959,13 @@ def cmd_body(args):
 
     plan = need + [b["id"]] if b["id"] not in have else need
     if _disattivata(b["id"], have):
+        # 'enable id:N' accenderebbe un solo file della pagina, e find_mod
+        # sceglie il primo: i file si nominano uno per uno.
+        _on, spente = _slug_stati(b["id"], have)
         print(f"\n{b.get('nome') or b['id']} e' gia' qui ma DISATTIVATA: i file\n"
-              f"stanno in deposito. Riaccendila invece di riscaricarla:\n"
-              f"  pakrat cp2077 enable id:{b['id']}")
+              f"stanno in deposito. Riaccendila invece di riscaricarla:")
+        for s in sorted(spente):
+            print(f"  pakrat cp2077 enable {s!r}")
     if not plan:
         print("\nnon c'e' niente da installare: e' gia' tutto qui.")
         return 0
