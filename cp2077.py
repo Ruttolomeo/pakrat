@@ -68,6 +68,18 @@ PROTECTED_FILES = ("bin/x64/cyberpunk2077.exe", "bin/x64/oo2ext_7_win64.dll",
 
 ARCHIVE_MOD_DIR = os.path.join("archive", "pc", "mod")
 
+# Dove puo' atterrare una mod, oltre agli .archive. Il controllo degli orfani
+# guarda tutte queste: fermarsi ad archive/pc/mod vede solo gli .archive, e una
+# mod puo' benissimo essere tutta DLL e script senza portarne uno (un plugin
+# RED4ext copiato a mano, una libreria che un'altra mod pretendeva).
+MOD_ROOTS = (ARCHIVE_MOD_DIR.replace(os.sep, "/"),
+             "mods",
+             "r6/scripts",
+             "r6/tweaks",
+             "red4ext/plugins",
+             "bin/x64/plugins",
+             "bin/x64/plugins/cyber_engine_tweaks/mods")
+
 # Dove ACU tiene i preset del personaggio. Le due sottocartelle non sono un
 # dettaglio di ordine: ACU nel menu mostra SOLO quella che corrisponde al corpo
 # di V, quindi un preset maschile finito fra i femminili non e' mal messo, e'
@@ -1504,6 +1516,38 @@ def cmd_restore(args):
         return 1
 
 
+def unmanaged_entries(install, mods):
+    """Voci nelle cartelle delle mod che nessuna mod nota rivendica.
+
+    Si ragiona per VOCE di primo livello, non per singolo file: dentro la
+    cartella di una mod ci sono anche i suoi log, il suo database e i preset che
+    hai salvato in gioco — roba che nel manifest non c'e' e che orfana non e'.
+    Se invece di una voce non si rivendica NIENTE, quella voce non l'ha messa
+    pakrat: o e' stata installata a mano, o e' avanzata da una rimozione.
+
+    Le voci che iniziano per punto si saltano: 'mods/.stub' e' del gioco.
+    """
+    known = {f.replace(os.sep, "/").lower() for m in mods for f in m.files}
+    out = []
+    for root in MOD_ROOTS:
+        d = os.path.join(install, root.replace("/", os.sep))
+        if not os.path.isdir(d):
+            continue
+        # una root dentro una voce gia' segnalata non si riapre: sarebbe la
+        # stessa notizia due volte, una in grande e una in dettaglio
+        if any(root == o or root.startswith(o + "/") for o in out):
+            continue
+        for name in sorted(os.listdir(d)):
+            if name.startswith("."):
+                continue
+            rel = f"{root}/{name}"
+            low = rel.lower()
+            if any(k == low or k.startswith(low + "/") for k in known):
+                continue
+            out.append(rel)
+    return out
+
+
 def cmd_verify(_args=None):
     """Confronta il manifest con quello che c'e' davvero sul disco."""
     install = resolve_install_dir()
@@ -1521,22 +1565,17 @@ def cmd_verify(_args=None):
                 print(f"    {rel}")
             if len(miss) > 5:
                 print(f"    ... e altri {len(miss) - 5}")
-    # file in archive/pc/mod che non appartengono a nessuna mod nota
-    amd = os.path.join(install, ARCHIVE_MOD_DIR)
-    if os.path.isdir(amd):
-        known = {f.replace(os.sep, "/").lower()
-                 for m in mods for f in m.files}
-        orphans = []
-        for name in sorted(os.listdir(amd)):
-            rel = f"{ARCHIVE_MOD_DIR}/{name}".replace(os.sep, "/")
-            if rel.lower() not in known:
-                orphans.append(name)
-        if orphans:
-            problems += 1
-            print(f"\n{len(orphans)} file in {ARCHIVE_MOD_DIR} non gestiti da pakrat:")
-            for n in orphans[:10]:
-                print(f"    {n}")
-            print("  (installati a mano? pakrat non li tocchera')")
+    orphans = unmanaged_entries(install, mods)
+    if orphans:
+        problems += 1
+        print(f"\n{len(orphans)} voci non gestite da pakrat:")
+        for rel in orphans[:15]:
+            print(f"    {rel}")
+        if len(orphans) > 15:
+            print(f"    ... e altre {len(orphans) - 15}")
+        print("  (installate a mano, o avanzate da una rimozione: pakrat non le\n"
+              "   tocchera'. Se una non ti risulta, e' roba che il gioco carica\n"
+              "   e che 'list' non ti fara' mai vedere)")
     miss_fw = sorted({f for m in mods for f in missing_frameworks(m.files, install)})
     if miss_fw:
         problems += 1
