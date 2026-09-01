@@ -821,6 +821,31 @@ def usable_files(files):
             if str(f.get("category_name") or "").upper() not in ("OLD_VERSION", "ARCHIVED")]
 
 
+_VER_IN_NAME = re.compile(r'(?<![a-z0-9])v?\d+(?:[._-]\d+)+[a-z]?(?![a-z0-9])', re.I)
+
+
+def _variant_key(name):
+    """Nome del file senza la versione, per raggruppare le release di una variante.
+
+    Molti autori mettono la versione nel nome del file ("Mod (CET) 3.0.4"), e
+    confrontare i nomi tali e quali metteva ogni release in una variante a se':
+    il target del confronto tornava a essere il file installato e nessun
+    aggiornamento risultava mai disponibile. Si toglie solo la versione
+    *punteggiata* (3.0.4, v1_2, 2-1-0); un numero singolo resta, perche' li'
+    distingue varianti parallele vere ("pack 1" / "pack 2", FFPP / FFPP2), che non
+    sono l'una l'aggiornamento dell'altra.
+
+    Limite accettato: se la cifra punteggiata nel nome e' la versione del *gioco*
+    e non della mod -- l'autore pubblica "MyMod 2.12" e "MyMod 2.21" come file
+    paralleli per due patch -- i due finiscono nello stesso gruppo e il piu' alto
+    passa per aggiornamento dell'altro. E' lo scambio di variante che il confronto
+    per nome esatto evitava; si e' scelto di correre il rischio perche' la versione
+    nel nome del file e' molto piu' comune del versionamento per patch di gioco.
+    """
+    s = _VER_IN_NAME.sub(" ", str(name or "").strip().lower())
+    return re.sub(r'[\s_.-]+', " ", s).strip()
+
+
 def remote_status(files, entry):
     """Confronta cosa c'e' su Nexus con cosa e' installato.
 
@@ -833,7 +858,8 @@ def remote_status(files, entry):
       "unknown"  non sappiamo quale file fosse installato
 
     Il confronto e' fatto dentro la stessa variante, identificata dal nome del
-    file: altrimenti un update ti sostituirebbe la variante scelta con un'altra.
+    file al netto della versione (vedi _variant_key): altrimenti un update ti
+    sostituirebbe la variante scelta con un'altra.
     """
     us = usable_files(files)
     if not us:
@@ -846,8 +872,8 @@ def remote_status(files, entry):
         f = core().pick_main_file(us)
         return "gone", f, (f.get("version") or "").strip(), \
             "il file installato non e' piu' su Nexus"
-    name = str(inst.get("name") or "").strip().lower()
-    same = [f for f in us if str(f.get("name") or "").strip().lower() == name] or [inst]
+    key = _variant_key(inst.get("name"))
+    same = [f for f in us if _variant_key(f.get("name")) == key] or [inst]
     target = max(same, key=lambda f: _vkey(f.get("version")))
     iv = (inst.get("version") or "").strip()
     tv = (target.get("version") or "").strip()
