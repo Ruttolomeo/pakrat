@@ -159,6 +159,21 @@ def missing_frameworks(files, install):
     return [f for f in requirements_of(files) if not framework_present(f, install)]
 
 
+# I .preset non sono intercambiabili fra i due gestori per dove STANNO: ognuno
+# guarda solo nella propria cartella. Character Preset Manager e' il successore
+# di ACU e ne dichiara l'incompatibilita', quindi di norma ne gira uno solo.
+CPM_DIR = "cyber_engine_tweaks/mods/character preset manager"
+CPM_INIT = "character preset manager (cet)/init.lua"
+CPM_MOD_ID = 31886
+
+
+def cpm_present(install):
+    """True se Character Preset Manager risulta installato sul disco."""
+    return os.path.exists(os.path.join(
+        install, "bin", "x64", "plugins", "cyber_engine_tweaks", "mods",
+        "Character Preset Manager (CET)", "init.lua"))
+
+
 # Da dove si prendono i core mod. NON da Nexus: sono tutti progetti open source
 # con release su GitHub, e da li' il download e' diretto, versionato e senza
 # bisogno di API key ne' di un account premium. L'ordine e' quello di
@@ -965,11 +980,18 @@ def install_archive(archive, install=None, enable=True, log=print, slug=None,
                 "il deploy\n    lo fa REDprelauncher (vedi: pakrat cp2077 deploy)")
         # qualche preset e' passato all'altro gestore (Character Preset
         # Manager) e porta il suo percorso: si installa benissimo, ma ACU in
-        # quella cartella non guarda, e allo specchio non comparirebbe nulla
-        if any("character preset manager" in r.lower() for r in written):
+        # quella cartella non guarda, e allo specchio non comparirebbe nulla.
+        # Due casi in cui tacere: il gestore c'e' gia' (allora il preset e' a
+        # posto), e la mod che stiamo installando E' il gestore, che di suo
+        # quei percorsi li ha tutti e si consigliava da sola.
+        low = [r.replace(os.sep, "/").lower() for r in written]
+        if (any(CPM_DIR in r for r in low)
+                and not any(r.endswith(CPM_INIT) for r in low)
+                and not cpm_present(install)):
             log("  ! questo preset e' nel formato di Character Preset Manager, "
-                "non di ACU:\n    serve quella mod per vederlo (nexusmods.com/"
-                + NEXUS_GAME + "/mods/31886)")
+                "non di ACU:\n    quella mod non risulta installata, senza di "
+                "lei il preset non compare\n    (nexusmods.com/"
+                + NEXUS_GAME + f"/mods/{CPM_MOD_ID})")
 
         # meglio dirlo ora che lasciartelo scoprire da un gioco che non carica
         for f in missing_frameworks(written, install):
