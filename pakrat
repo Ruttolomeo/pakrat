@@ -998,6 +998,50 @@ def pick_main_file(files):
     return max(pool, key=lambda f: f.get("uploaded_timestamp") or 0)
 
 
+def usable_files(files):
+    """Toglie i file archiviati/superati: quel che resta e' scaricabile davvero."""
+    return [f for f in files
+            if str(f.get("category_name") or "").upper() not in ("OLD_VERSION", "ARCHIVED")]
+
+
+def version_key(v):
+    """Chiave d'ordinamento tollerante per versioni tipo '2.1a', '0.98.5', '4.0'."""
+    import re
+    out = []
+    for tok in re.findall(r'\d+|[A-Za-z]+', str(v or "")):
+        out.append((0, int(tok), "") if tok.isdigit() else (1, 0, tok.lower()))
+    return out
+
+
+def variant_key(name):
+    """Nome del file senza la versione, per raggruppare le release di una variante.
+
+    Condivisa fra MW5 e Cyberpunk: entrambi i backend confrontano i file di
+    Nexus per variante (non solo per versione) prima di proporli come
+    aggiornamento, e la logica per isolare la variante dal nome file e' la
+    stessa nei due giochi.
+
+    Molti autori mettono la versione nel nome del file ("Mod (CET) 3.0.4"), e
+    confrontare i nomi tali e quali metteva ogni release in una variante a se':
+    il target del confronto tornava a essere il file installato e nessun
+    aggiornamento risultava mai disponibile. Si toglie solo la versione
+    *punteggiata* (3.0.4, v1_2, 2-1-0); un numero singolo resta, perche' li'
+    distingue varianti parallele vere ("pack 1" / "pack 2", FFPP / FFPP2), che non
+    sono l'una l'aggiornamento dell'altra.
+
+    Limite accettato: se la cifra punteggiata nel nome e' la versione del *gioco*
+    e non della mod -- l'autore pubblica "MyMod 2.12" e "MyMod 2.21" come file
+    paralleli per due patch -- i due finiscono nello stesso gruppo e il piu' alto
+    passa per aggiornamento dell'altro. E' lo scambio di variante che il confronto
+    per nome esatto evitava; si e' scelto di correre il rischio perche' la versione
+    nel nome del file e' molto piu' comune del versionamento per patch di gioco.
+    """
+    import re
+    ver_in_name = re.compile(r'(?<![a-z0-9])v?\d+(?:[._-]\d+)+[a-z]?(?![a-z0-9])', re.I)
+    s = ver_in_name.sub(" ", str(name or "").strip().lower())
+    return re.sub(r'[\s_.-]+', " ", s).strip()
+
+
 def download_url(url, dest, progress=None):
     """Scarica su file temporaneo e rinomina solo a download completo."""
     import urllib.parse

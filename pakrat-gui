@@ -2,8 +2,11 @@
 """
 pakrat-gui - interfaccia grafica Qt per pakrat.
 
-Riusa il core di pakrat (parser LSPK, load order, backup, Nexus): qui c'e' solo
-la presentazione, nessuna logica duplicata.
+Riusa il core di pakrat (parser LSPK, load order, backup, Nexus) e i backend
+dei tre giochi (mw5.py, cp2077.py): qui c'e' solo la presentazione, nessuna
+logica duplicata. La differenza fra i giochi sta tutta negli adapter qui
+sotto: la MainWindow non sa quale gioco sta gestendo, parla solo con
+self.adapter.
 
 Copyright (C) 2026 Ruttolomeo
 SPDX-License-Identifier: GPL-3.0-or-later
@@ -22,9 +25,9 @@ from PySide6.QtCore import Qt, QThread, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QFileDialog,
                                QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-                               QLineEdit, QMainWindow, QMessageBox, QPushButton,
-                               QStatusBar, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout, QWidget)
+                               QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+                               QMessageBox, QPushButton, QStatusBar, QTableWidget,
+                               QTableWidgetItem, QVBoxLayout, QWidget)
 
 # realpath e non abspath: cosi' funziona anche lanciato da un symlink in ~/.local/bin
 CORE_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), "pakrat")
@@ -47,63 +50,568 @@ COL_ON, COL_NUM, COL_NAME, COL_VER, COL_AUTHOR, COL_NEXUS = range(6)
 HEADERS = ["", "#", "Mod", "Versione", "Autore", "Nexus"]
 
 
-class CheckWorker(QThread):
-    """Il controllo aggiornamenti fa rete: fuori dal thread della UI."""
-    row_done = Signal(str, str)
-    finished_all = Signal(str)
+# --------------------------------------------------------------- adapter ---
+class BG3Adapter:
+    """Fa da tramite fra la MainWindow (generica) e il core, l'unico dei tre
+    backend nato con una GUI in mente."""
 
-    def __init__(self, mods):
-        super().__init__()
-        self.mods = mods
+    key = "bg3"
+    label = "Baldur's Gate 3"
+    nexus_domain = "baldursgate3"
+    supports_reorder = True
+    supports_match = True
+    supports_discover = True
+    # rimuovere una mod cancella solo il .pak: la voce nel load order resta
+    # nello stato finche' non si preme Salva, che riscrive modsettings.lsx
+    removal_needs_save = True
+    supports_backup_restore = True
+    backup_prefix = "modsettings-"
+    file_filter = "Mod BG3 (*.pak)"
+    add_dialog_title = "Scegli un .pak"
 
-    def run(self):
+    def is_configured(self):
+        return bool(core.LARIAN) and os.path.isdir(core.LARIAN)
+
+    def run_setup(self, parent=None):
+        dlg = SetupDialog(parent)
+        return dlg.exec() == QDialog.Accepted and bool(dlg.chosen)
+
+    def is_installable(self, path):
+        return path.lower().endswith(".pak")
+
+    def build_state(self):
+        return core.build_state()
+
+    def install_pak(self, path):
+        return core.install_pak(path)
+
+    def write_state(self, state):
+        return core.write_modsettings(state)
+
+    def backup_dir(self):
+        return core.BACKUP_DIR
+
+    def modsettings_path(self):
+        return core.MODSETTINGS
+
+    def backup_now(self):
+        return core.backup_modsettings()
+
+    def remove_confirm(self, m):
+        return True, f"Verra' cancellato il file:\n{m.pak}\n\nProcedere?"
+
+    def remove(self, m):
+        try:
+            os.remove(m.pak)
+        except OSError as ex:
+            return False, str(ex)
+        return True, f"eliminato {m.name}"
+
+    def link(self, m, ref):
+        nid = core.parse_nexus_ref(ref)
+        cfg = core.load_config()
+        cfg["mods"].setdefault(m.uuid, {}).update({"nexus_id": nid, "name": m.name})
+        core.save_config(cfg)
+        return nid
+
+    def link_info(self, m):
         try:
             cfg = core.load_config()
-        except SystemExit as ex:
-            self.finished_all.emit(str(ex))
-            return
+        except SystemExit:
+            return None
+        return cfg.get("mods", {}).get(m.uuid, {}).get("nexus_id")
+
+    def link_info_bulk(self, mods):
+        """Come link_info ma su piu' mod, con un solo load_config()."""
+        try:
+            cfg = core.load_config()
+        except SystemExit:
+            return {m.uuid: None for m in mods}
+        entries = cfg.get("mods", {})
+        return {m.uuid: entries.get(m.uuid, {}).get("nexus_id") for m in mods}
+
+    def set_link(self, m, mod_id, version=""):
+        cfg = core.load_config()
+        cfg["mods"].setdefault(m.uuid, {}).update(
+            {"nexus_id": mod_id, "name": m.name, "installed_version": m.version,
+             "remote_version": version})
+        core.save_config(cfg)
+
+    def find_candidates(self, mod, api_key, extra_term=None):
+        return core.find_candidates(mod, api_key, extra_term=extra_term)
+
+    def mod_page_url(self, mod_id):
+        return core.mod_file_page_url(mod_id)
+
+    def mod_url(self, mod_id):
+        return f"https://www.nexusmods.com/{self.nexus_domain}/mods/{mod_id}"
+
+    def mods_list_url(self):
+        return f"https://www.nexusmods.com/{self.nexus_domain}/mods/"
+
+    def check_updates(self, mods, on_row):
+        cfg = core.load_config()
         if not cfg["nexus_api_key"]:
-            self.finished_all.emit("API key Nexus non configurata (menu Nexus -> Imposta API key)")
-            return
-        mapped = [m for m in self.mods
+            return "API key Nexus non configurata (menu Nexus -> Imposta API key)"
+        mapped = [m for m in mods
                   if m.uuid in cfg["mods"] and cfg["mods"][m.uuid].get("nexus_id")]
         if not mapped:
-            self.finished_all.emit("nessuna mod associata a un ID Nexus: usa Nexus -> Associa a Nexus")
-            return
+            return "nessuna mod associata a un ID Nexus: usa Nexus -> Associa a Nexus"
         errors = 0
         for m in mapped:
             entry = cfg["mods"][m.uuid]
             try:
                 info = core.nexus_get(f"/mods/{entry['nexus_id']}.json", cfg["nexus_api_key"])
             except core.NexusError as ex:
-                self.row_done.emit(m.uuid, f"errore: {ex}")
+                on_row(m.uuid, f"errore: {ex}")
                 errors += 1
                 continue
             remote = (info.get("version") or "").strip()
             local = entry.get("installed_version") or m.version
             if info.get("status") not in (None, "published"):
-                self.row_done.emit(m.uuid, f"mod {info.get('status')}")
+                on_row(m.uuid, f"mod {info.get('status')}")
             elif remote and remote != local:
-                self.row_done.emit(m.uuid, f"aggiornamento -> {remote}")
+                on_row(m.uuid, f"aggiornamento -> {remote}")
             else:
-                self.row_done.emit(m.uuid, "aggiornata")
+                on_row(m.uuid, "aggiornata")
             entry["remote_version"] = remote
         core.save_config(cfg)
-        self.finished_all.emit(f"controllo completato su {len(mapped)} mod"
-                               + (f", {errors} errori" if errors else ""))
+        return (f"controllo completato su {len(mapped)} mod"
+                + (f", {errors} errori" if errors else ""))
+
+    def update_all(self, mods, on_row):
+        cfg = core.load_config()
+        ok = fail = 0
+        for m in mods:
+            entry = cfg["mods"].get(m.uuid, {})
+            on_row(m.uuid, "aggiornamento...")
+            try:
+                good, res = core.update_mod(
+                    m, entry, cfg["nexus_api_key"],
+                    log=lambda s, u=m.uuid: on_row(u, s.strip()))
+            except Exception as ex:
+                good, res = False, f"errore: {ex}"
+            on_row(m.uuid, res)
+            ok += good
+            fail += not good
+            core.save_config(cfg)
+        return f"aggiornate {ok}, non aggiornate {fail}"
+
+    def discover_all(self, mods, on_row):
+        cfg = core.load_config()
+        found = miss = err = 0
+        for m in mods:
+            on_row(m.uuid, "hash...")
+            try:
+                digest = core.file_md5(m.pak)
+            except OSError as ex:
+                on_row(m.uuid, f"errore: {ex}")
+                err += 1
+                continue
+            try:
+                res = core.nexus_get(f"/mods/md5_search/{digest}.json", cfg["nexus_api_key"])
+                info = res[0]["mod"]
+            except core.NexusError as ex:
+                if "404" in str(ex) or "non trovata" in str(ex):
+                    on_row(m.uuid, "non su Nexus")
+                    miss += 1
+                else:
+                    on_row(m.uuid, f"errore: {ex}")
+                    err += 1
+                continue
+            except (KeyError, IndexError, TypeError):
+                on_row(m.uuid, "risposta inattesa")
+                miss += 1
+                continue
+            cfg["mods"].setdefault(m.uuid, {}).update(
+                {"nexus_id": info["mod_id"], "name": m.name,
+                 "installed_version": (info.get("version") or "").strip() or m.version})
+            on_row(m.uuid, f"id {info['mod_id']}")
+            found += 1
+        core.save_config(cfg)
+        return (f"identificate {found}, non trovate {miss}"
+                + (f", errori {err}" if err else ""))
+
+
+class BackendAdapter:
+    """Adapter comune a MW5 e Cyberpunk.
+
+    I due backend condividono la forma: stesso config.json (una chiave loro
+    dentro, ns['mods'] chiavato su un identificatore locale), stessi nomi di
+    funzione (scan_mods, set_enabled, remove_mod, update_one, remote_status,
+    parse_ref, ...). Cambia solo quale attributo identifica una mod (folder
+    per MW5, slug per Cyberpunk) e i dettagli passati alle sottoclassi.
+
+    Niente identificazione via MD5 (nessuno dei due pubblica una mod come
+    singolo file hashabile) e niente 'Associa a Nexus...' automatico (nessun
+    backend fa ancora una ricerca per somiglianza come core.find_candidates):
+    resta solo l'associazione manuale per ID/URL.
+    """
+    supports_reorder = False
+    supports_match = False
+    supports_discover = False
+    supports_backup_restore = False
+    backup_prefix = ""
+    file_filter = "Archivi mod (*.zip *.rar *.7z)"
+    add_dialog_title = "Scegli un archivio mod"
+    # remove_mod aggiorna gia' file e config: lo stato in tabella dopo una
+    # rimozione e' gia' quello salvato, a differenza di BG3
+    removal_needs_save = False
+
+    backend_name = None     # "mw5" / "cp2077"
+    id_attr = ""            # "folder" / "slug"
+    link_fn_name = ""       # "link_folder" / "link_slug"
+
+    def __init__(self):
+        self._mod = None
+        self._orig_order = None
+
+    @property
+    def mod(self):
+        if self._mod is None:
+            self._mod = core.load_backend(self.backend_name)
+        return self._mod
+
+    def mod_key(self, m):
+        return getattr(m, self.id_attr)
+
+    def is_configured(self):
+        return bool(self.mod.resolve_install_dir())
+
+    def run_setup(self, parent=None):
+        dlg = BackendSetupDialog(parent, self)
+        return dlg.exec() == QDialog.Accepted and bool(dlg.chosen)
+
+    def is_installable(self, path):
+        return path.lower().endswith((".zip", ".rar", ".7z"))
+
+    def build_state(self):
+        install = self.mod.resolve_install_dir()
+        mods = self.mod.scan_mods()
+        ns = None     # caricata al piu' una volta, solo se serve a missing()
+        for m in mods:
+            m.uuid = self.mod_key(m)
+            m.is_base = False
+            m.pak = None
+            # istantanea dello stato letto da disco: write_state la confronta
+            # con quello che l'utente ha effettivamente cambiato, invece di
+            # riscrivere tutto ogni volta che si preme Salva
+            m._orig_enabled = m.enabled
+            if not hasattr(m, "author"):
+                m.author = ""
+            if not hasattr(m, "has_pak"):
+                if install and hasattr(m, "missing"):
+                    if ns is None:
+                        _cfg, ns = self.mod.cfg_load()
+                    m.has_pak = not m.missing(install, ns)
+                else:
+                    m.has_pak = True
+        self._orig_order = [self.mod_key(m) for m in mods]
+        return mods, []
+
+    def install_pak(self, path):
+        if self.mod.game_running():
+            return False, f"{self.label} e' aperto: chiudilo prima di installare una mod"
+        try:
+            got = self.mod.install_archive(path)
+        except Exception as ex:
+            return False, str(ex)
+        if not got:
+            return False, "installazione non riuscita (nessuna mod riconosciuta nell'archivio)"
+        name = got[0] if isinstance(got, list) else got
+        return True, f"installata: {name}"
+
+    def write_state(self, state):
+        """Scrive solo cio' che e' davvero cambiato rispetto a build_state().
+
+        Un riordino globale su MW5 riscrive il mod.json di ogni mod (author
+        file), e su Cyberpunk un enable/disable sposta file di gioco: farlo
+        per tutte le mod a ogni Salva, anche quando l'utente ha solo spuntato
+        una casella, sarebbe una scrittura di massa non richiesta.
+        """
+        if self.mod.game_running():
+            return False, f"{self.label} e' aperto: chiudilo prima di salvare"
+        orig_order = self._orig_order if self._orig_order is not None else \
+            [self.mod_key(m) for m in state]
+        to_on = [m for m in state if m.enabled and not getattr(m, "_orig_enabled", m.enabled)]
+        to_off = [m for m in state if not m.enabled and getattr(m, "_orig_enabled", m.enabled)]
+        want_order = [self.mod_key(m) for m in state]
+        order_changed = self.supports_reorder and want_order != orig_order
+        if not to_on and not to_off and not order_changed:
+            return True, "nessuna modifica da salvare"
+        touched = {self.mod_key(m) for m in to_on} | {self.mod_key(m) for m in to_off}
+        applied = set()
+        skipped = []
+        try:
+            if to_on:
+                keys = [self.mod_key(m) for m in to_on]
+                done = set(self.mod.set_enabled(keys, True))
+                applied |= done
+                skipped += [k for k in keys if k not in done]
+            if to_off:
+                keys = [self.mod_key(m) for m in to_off]
+                done = set(self.mod.set_enabled(keys, False))
+                applied |= done
+                skipped += [k for k in keys if k not in done]
+            if order_changed:
+                changed = self.mod.reorder(want_order)
+                changed_keys = {k for k, _n in changed}
+                skipped += [k for k in want_order if k not in changed_keys]
+        except Exception as ex:
+            return False, str(ex)
+        for m in state:
+            key = self.mod_key(m)
+            if key not in touched or key in applied:
+                m._orig_enabled = m.enabled
+        if order_changed:
+            self._orig_order = want_order
+        if skipped:
+            uniq = sorted(set(skipped))
+            return False, (f"{len(uniq)} mod non applicate (gioco aperto o file "
+                          "mancanti): " + ", ".join(uniq[:5]))
+        n = len(to_on) + len(to_off)
+        return True, f"{n} mod aggiornate" + (", ordine aggiornato" if order_changed else "")
+
+    def backup_dir(self):
+        return core.BACKUP_DIR
+
+    def remove_confirm(self, m):
+        return True, (f"'{m.name}' verra' rimossa (spostata in archivio, non "
+                      "cancellata).\n\nProcedere?")
+
+    def remove(self, m):
+        if self.mod.game_running():
+            return False, f"{self.label} e' aperto: chiudilo prima di rimuovere una mod"
+        try:
+            dest = self.mod.remove_mod(self.mod_key(m))
+        except Exception as ex:
+            return False, str(ex)
+        if dest is None:
+            return False, "non rimossa"
+        return True, ("cancellata" if dest == "" else f"spostata in archivio: {dest}")
+
+    def link(self, m, ref):
+        nid = self.mod.parse_ref(ref)
+        cfg, ns = self.mod.cfg_load()
+        getattr(self.mod, self.link_fn_name)(self.mod_key(m), nid, ns)
+        self.mod.cfg_save(cfg)
+        return nid
+
+    def link_info(self, m):
+        try:
+            _cfg, ns = self.mod.cfg_load()
+        except SystemExit:
+            return None
+        return (ns.get("mods", {}).get(self.mod_key(m)) or {}).get("nexus_id")
+
+    def link_info_bulk(self, mods):
+        """Come link_info ma su piu' mod, con un solo cfg_load()."""
+        try:
+            _cfg, ns = self.mod.cfg_load()
+        except SystemExit:
+            return {m.uuid: None for m in mods}
+        entries = ns.get("mods", {})
+        return {m.uuid: (entries.get(self.mod_key(m)) or {}).get("nexus_id") for m in mods}
+
+    def set_link(self, m, mod_id, version=""):
+        cfg, ns = self.mod.cfg_load()
+        getattr(self.mod, self.link_fn_name)(self.mod_key(m), mod_id, ns, version=version)
+        self.mod.cfg_save(cfg)
+
+    def find_candidates(self, mod, api_key, extra_term=None):
+        raise NotImplementedError("associazione automatica non disponibile per questo gioco")
+
+    def mod_page_url(self, mod_id):
+        return self.mod.mod_page_url(mod_id)
+
+    def mod_url(self, mod_id):
+        return f"https://www.nexusmods.com/{self.nexus_domain}/mods/{mod_id}"
+
+    def mods_list_url(self):
+        return f"https://www.nexusmods.com/{self.nexus_domain}/mods/"
+
+    def check_updates(self, mods, on_row):
+        cfg, ns = self.mod.cfg_load()
+        api_key = cfg.get("nexus_api_key")
+        if not api_key:
+            return "API key Nexus non configurata (menu Nexus -> Imposta API key)"
+        mapped = [m for m in mods
+                  if (ns.get("mods", {}).get(self.mod_key(m)) or {}).get("nexus_id")]
+        if not mapped:
+            return "nessuna mod associata a un ID Nexus: usa Nexus -> Associa per ID/URL"
+        errors = 0
+        for m in mapped:
+            key = self.mod_key(m)
+            e = ns["mods"][key]
+            try:
+                files = self.mod.nexus_get(f"/mods/{e['nexus_id']}/files.json",
+                                           api_key).get("files", [])
+            except core.NexusError as ex:
+                on_row(key, f"errore: {ex}")
+                errors += 1
+                continue
+            state, _f, rv, note = self.mod.remote_status(files, e)
+            label = {
+                "update": f"aggiornamento -> {rv or '?'}",
+                "gone": f"! {note}" if note else "non piu' su Nexus",
+                "variant": f"aggiornata ({note})" if note else "aggiornata",
+                "unknown": "non verificabile (reinstalla per registrare il file)",
+            }.get(state, "aggiornata")
+            on_row(key, label)
+            e["remote_version"] = rv
+        self.mod.cfg_save(cfg)
+        return (f"controllo completato su {len(mapped)} mod"
+                + (f", {errors} errori" if errors else ""))
+
+    def update_all(self, mods, on_row):
+        install = self.mod.resolve_install_dir()
+        cfg, ns = self.mod.cfg_load()
+        api_key = cfg.get("nexus_api_key")
+        ok = fail = 0
+        for m in mods:
+            key = self.mod_key(m)
+            # entry letta una volta sola all'inizio: update_one salva la sua
+            # copia internamente, non serve ricaricare da disco a ogni giro
+            entry = ns.get("mods", {}).get(key, {})
+            on_row(key, "aggiornamento...")
+            try:
+                good, res = self.mod.update_one(
+                    m, entry, api_key, install,
+                    log=lambda s, u=key: on_row(u, s.strip()))
+            except Exception as ex:
+                good, res = False, f"errore: {ex}"
+            on_row(key, res)
+            ok += good
+            fail += not good
+        return f"aggiornate {ok}, non aggiornate {fail}"
+
+    def discover_all(self, mods, on_row):
+        raise NotImplementedError("identificazione via MD5 non disponibile per questo gioco")
+
+
+class MW5Adapter(BackendAdapter):
+    backend_name = "mw5"
+    key = "mw5"
+    label = "MechWarrior 5: Mercenaries"
+    nexus_domain = "mechwarrior5mercenaries"
+    id_attr = "folder"
+    link_fn_name = "link_folder"
+    supports_reorder = True
+    supports_backup_restore = True
+    backup_prefix = "modlist-"
+
+    def modsettings_path(self):
+        return self.mod.modlist_path()
+
+    def backup_now(self):
+        return self.mod.backup_modlist()
+
+
+class CP2077Adapter(BackendAdapter):
+    backend_name = "cp2077"
+    key = "cp2077"
+    label = "Cyberpunk 2077"
+    nexus_domain = "cyberpunk2077"
+    id_attr = "slug"
+    link_fn_name = "link_slug"
+
+
+# I tre giochi che pakrat gestisce. Un'eventuale futura aggiunta senza adapter
+# pronto comparirebbe qui con factory=None: il selettore la mostra comunque,
+# ma rimanda alla CLI invece di aprirla.
+GAMES = [
+    ("bg3", "Baldur's Gate 3", BG3Adapter),
+    ("mw5", "MechWarrior 5: Mercenaries", MW5Adapter),
+    ("cp2077", "Cyberpunk 2077", CP2077Adapter),
+]
+
+
+class ChooseGameDialog(QDialog):
+    """Selettore di gioco mostrato all'avvio (e da 'Cambia gioco...' nel menu)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("pakrat - scegli il gioco")
+        self.resize(420, 300)
+        self.chosen = None
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("<b>Quale gioco vuoi gestire?</b>"))
+
+        self.list = QListWidget()
+        for key, label, factory in GAMES:
+            text = label if factory else f"{label} (solo da riga di comando per ora)"
+            it = QListWidgetItem(text)
+            it.setData(Qt.UserRole, (key, factory))
+            if not factory:
+                it.setForeground(QColor("#999999"))
+            self.list.addItem(it)
+        self.list.setCurrentRow(0)
+        self.list.itemDoubleClicked.connect(lambda _: self.accept_choice())
+        lay.addWidget(self.list)
+
+        self.info = QLabel("")
+        self.info.setWordWrap(True)
+        lay.addWidget(self.info)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        btn_quit = QPushButton("Esci")
+        btn_quit.clicked.connect(self.reject)
+        self.btn_ok = QPushButton("Apri")
+        self.btn_ok.clicked.connect(self.accept_choice)
+        row.addWidget(btn_quit)
+        row.addWidget(self.btn_ok)
+        lay.addLayout(row)
+
+    def accept_choice(self):
+        it = self.list.currentItem()
+        if it is None:
+            return
+        key, factory = it.data(Qt.UserRole)
+        if factory is None:
+            self.info.setText(
+                f"Non ancora disponibile in GUI: usa 'pakrat {key} ...' da terminale.")
+            return
+        self.chosen = factory()
+        self.accept()
+
+
+class AdapterWorker(QThread):
+    """Esegue un metodo batch dell'adapter (check/update/discover) fuori dal
+    thread della UI: fanno tutti rete e/o I/O, e hanno la stessa forma
+    (mods, on_row) -> messaggio riassuntivo. Un'unica classe invece di una per
+    operazione, cosi' la gestione degli errori non puo' divergere fra le tre.
+    """
+    row_done = Signal(str, str)
+    finished_all = Signal(str)
+
+    def __init__(self, adapter, method, mods):
+        super().__init__()
+        self.adapter, self.method, self.mods = adapter, method, mods
+
+    def run(self):
+        try:
+            fn = getattr(self.adapter, self.method)
+            msg = fn(self.mods, lambda u, t: self.row_done.emit(u, t))
+        except SystemExit as ex:
+            msg = str(ex)
+        except Exception as ex:
+            msg = f"errore: {ex}"
+        self.finished_all.emit(msg)
 
 
 class SearchWorker(QThread):
     """Ricerca candidati su Nexus (rete): fuori dal thread della UI."""
     done = Signal(list, list)
 
-    def __init__(self, mod, api_key, term=None):
+    def __init__(self, adapter, mod, api_key, term=None):
         super().__init__()
-        self.mod, self.api_key, self.term = mod, api_key, term
+        self.adapter, self.mod, self.api_key, self.term = adapter, mod, api_key, term
 
     def run(self):
         try:
-            cands, errs = core.find_candidates(self.mod, self.api_key, extra_term=self.term)
+            cands, errs = self.adapter.find_candidates(self.mod, self.api_key, extra_term=self.term)
         except core.NexusError as ex:
             self.done.emit([], [str(ex)])
             return
@@ -113,9 +621,9 @@ class SearchWorker(QThread):
 class MatchDialog(QDialog):
     """Scelta manuale del corrispondente su Nexus fra i candidati trovati."""
 
-    def __init__(self, parent, mod, api_key):
+    def __init__(self, parent, adapter, mod, api_key):
         super().__init__(parent)
-        self.mod, self.api_key = mod, api_key
+        self.adapter, self.mod, self.api_key = adapter, mod, api_key
         self.chosen = None
         self.cands = []
         self.worker = None
@@ -123,7 +631,7 @@ class MatchDialog(QDialog):
         self.resize(820, 460)
 
         lay = QVBoxLayout(self)
-        head = QLabel(f"<b>{mod.name}</b><br>autore nel .pak: "
+        head = QLabel(f"<b>{mod.name}</b><br>autore: "
                       f"<i>{mod.author or 'sconosciuto'}</i> &nbsp; versione locale: {mod.version}")
         head.setTextFormat(Qt.RichText)
         lay.addWidget(head)
@@ -172,7 +680,7 @@ class MatchDialog(QDialog):
     def start_search(self, term):
         self.info.setText("ricerca in corso...")
         self.btn_ok.setEnabled(False)
-        self.worker = SearchWorker(self.mod, self.api_key, term)
+        self.worker = SearchWorker(self.adapter, self.mod, self.api_key, term)
         self.worker.done.connect(self.on_results)
         self.worker.start()
 
@@ -209,8 +717,7 @@ class MatchDialog(QDialog):
     def open_selected(self):
         c = self.selected()
         if c:
-            QDesktopServices.openUrl(
-                QUrl(f"https://www.nexusmods.com/baldursgate3/mods/{c['modId']}"))
+            QDesktopServices.openUrl(QUrl(self.adapter.mod_url(c['modId'])))
 
     def accept_choice(self):
         c = self.selected()
@@ -234,78 +741,6 @@ class AccountWorker(QThread):
             self.done.emit({})
 
 
-class UpdateWorker(QThread):
-    """Scarica e installa gli aggiornamenti: rete + I/O, fuori dalla UI."""
-    row_done = Signal(str, str)
-    finished_all = Signal(str)
-
-    def __init__(self, mods):
-        super().__init__()
-        self.mods = mods
-
-    def run(self):
-        cfg = core.load_config()
-        ok = fail = 0
-        for m in self.mods:
-            entry = cfg["mods"].get(m.uuid, {})
-            self.row_done.emit(m.uuid, "aggiornamento...")
-            try:
-                good, res = core.update_mod(
-                    m, entry, cfg["nexus_api_key"],
-                    log=lambda s, u=m.uuid: self.row_done.emit(u, s.strip()))
-            except Exception as ex:
-                good, res = False, f"errore: {ex}"
-            self.row_done.emit(m.uuid, res)
-            ok += good
-            fail += not good
-            core.save_config(cfg)
-        self.finished_all.emit(f"aggiornate {ok}, non aggiornate {fail}")
-
-
-class DiscoverWorker(QThread):
-    """Hash MD5 + lookup su Nexus: entrambi lenti, fuori dalla UI."""
-    row_done = Signal(str, str)
-    finished_all = Signal(str)
-
-    def __init__(self, mods):
-        super().__init__()
-        self.mods = mods
-
-    def run(self):
-        cfg = core.load_config()
-        found = miss = err = 0
-        for m in self.mods:
-            self.row_done.emit(m.uuid, "hash...")
-            try:
-                digest = core.file_md5(m.pak)
-            except OSError as ex:
-                self.row_done.emit(m.uuid, f"errore: {ex}")
-                err += 1
-                continue
-            try:
-                res = core.nexus_get(f"/mods/md5_search/{digest}.json",
-                                     cfg["nexus_api_key"])
-                info = res[0]["mod"]
-            except core.NexusError as ex:
-                if "404" in str(ex) or "non trovata" in str(ex):
-                    self.row_done.emit(m.uuid, "non su Nexus")
-                    miss += 1
-                else:
-                    self.row_done.emit(m.uuid, f"errore: {ex}")
-                    err += 1
-                continue
-            except (KeyError, IndexError, TypeError):
-                self.row_done.emit(m.uuid, "risposta inattesa")
-                miss += 1
-                continue
-            cfg["mods"].setdefault(m.uuid, {}).update(
-                {"nexus_id": info["mod_id"], "name": m.name,
-                 "installed_version": (info.get("version") or "").strip() or m.version})
-            self.row_done.emit(m.uuid, f"id {info['mod_id']}")
-            found += 1
-        core.save_config(cfg)
-        self.finished_all.emit(
-            f"identificate {found}, non trovate {miss}" + (f", errori {err}" if err else ""))
 
 
 class SetupDialog(QDialog):
@@ -422,10 +857,117 @@ class SetupDialog(QDialog):
             self._apply(self.found[r])
 
 
+class BackendSetupDialog(QDialog):
+    """Wizard iniziale per MW5/Cyberpunk: sceglie la cartella d'installazione.
+
+    Stessa idea di SetupDialog per BG3, ma generico: usa detect_install_dirs()
+    e _looks_like_install() del backend invece della logica Larian.
+    """
+
+    def __init__(self, parent, adapter):
+        super().__init__(parent)
+        self.adapter = adapter
+        self.setWindowTitle(f"pakrat - configurazione {adapter.label}")
+        self.resize(760, 380)
+        self.chosen = None
+        self.found = []
+
+        lay = QVBoxLayout(self)
+        intro = QLabel(f"<b>Dov'e' installato {adapter.label}?</b>")
+        intro.setTextFormat(Qt.RichText)
+        intro.setWordWrap(True)
+        lay.addWidget(intro)
+
+        self.list = QListWidget()
+        self.list.itemDoubleClicked.connect(lambda _: self.use_selected())
+        lay.addWidget(self.list)
+
+        prow = QHBoxLayout()
+        self.path_box = QLineEdit()
+        self.path_box.setPlaceholderText("...oppure incolla qui un percorso")
+        self.path_box.returnPressed.connect(self.use_typed)
+        btn_browse = QPushButton("Sfoglia...")
+        btn_browse.clicked.connect(self.browse)
+        prow.addWidget(self.path_box)
+        prow.addWidget(btn_browse)
+        lay.addLayout(prow)
+
+        self.info = QLabel("")
+        self.info.setWordWrap(True)
+        lay.addWidget(self.info)
+
+        brow = QHBoxLayout()
+        btn_rescan = QPushButton("Ricerca di nuovo")
+        btn_rescan.clicked.connect(self.rescan)
+        self.btn_ok = QPushButton("Usa questa cartella")
+        self.btn_ok.clicked.connect(self.use_selected)
+        btn_quit = QPushButton("Esci")
+        btn_quit.clicked.connect(self.reject)
+        brow.addWidget(btn_rescan)
+        brow.addStretch()
+        brow.addWidget(btn_quit)
+        brow.addWidget(self.btn_ok)
+        lay.addLayout(brow)
+
+        self.rescan()
+
+    def rescan(self):
+        found = self.adapter.mod.detect_install_dirs()
+        self.found = found
+        self.list.clear()
+        for p in found:
+            self.list.addItem(p)
+        if found:
+            self.list.setCurrentRow(0)
+            self.info.setText(f"{len(found)} installazioni trovate. "
+                              "Scegline una, oppure indica un percorso a mano.")
+        else:
+            self.info.setText("Nessuna installazione trovata automaticamente. "
+                              "Indica il percorso a mano qui sotto.")
+        self.btn_ok.setEnabled(bool(found))
+
+    def browse(self):
+        d = QFileDialog.getExistingDirectory(
+            self, f"Cartella di installazione di {self.adapter.label}",
+            os.path.expanduser("~"))
+        if d:
+            self.path_box.setText(d)
+            self.use_typed()
+
+    def _apply(self, path):
+        path = os.path.abspath(os.path.expanduser(path))
+        if not self.adapter.mod._looks_like_install(path):
+            self.info.setText(
+                "<span style='color:#cc5555'>non sembra un'installazione di "
+                f"{self.adapter.label}: {path}</span>")
+            self.info.setTextFormat(Qt.RichText)
+            return
+        cfg, ns = self.adapter.mod.cfg_load()
+        ns["install_dir"] = path
+        self.adapter.mod.cfg_save(cfg)
+        self.chosen = path
+        self.accept()
+
+    def use_typed(self):
+        p = self.path_box.text().strip()
+        if p:
+            self._apply(p)
+
+    def use_selected(self):
+        p = self.path_box.text().strip()
+        if p:
+            self._apply(p)
+            return
+        r = self.list.currentRow()
+        if 0 <= r < len(self.found):
+            self._apply(self.found[r])
+
+
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, adapter):
         super().__init__()
-        self.setWindowTitle("pakrat")
+        self.adapter = adapter
+        self.setWindowTitle(f"pakrat - {adapter.label}")
         self.resize(940, 620)
         self.state = []
         self.dirty = False
@@ -455,7 +997,7 @@ class MainWindow(QMainWindow):
         bar = QHBoxLayout()
         self.btn_up = QPushButton("Su")
         self.btn_down = QPushButton("Giu")
-        self.btn_add = QPushButton("Aggiungi .pak...")
+        self.btn_add = QPushButton("Aggiungi mod...")
         self.btn_del = QPushButton("Elimina")
         self.btn_match = QPushButton("Associa a Nexus...")
         self.btn_match.setToolTip("Cerca la mod selezionata su Nexus e scegli fra i candidati.\n"
@@ -466,14 +1008,14 @@ class MainWindow(QMainWindow):
         self.btn_browse = QPushButton("Apri nel browser")
         self.btn_browse.setToolTip("Apre nexusmods.com nel browser di sistema.\n"
                                    "Sulla pagina della mod selezionata se associata,\n"
-                                   "altrimenti sull'elenco mod di Baldur's Gate 3.")
+                                   "altrimenti sull'elenco mod del gioco.")
         self.btn_browse.clicked.connect(self.browse_nexus)
         self.btn_check = QPushButton("Controlla aggiornamenti")
         self.btn_update = QPushButton("Aggiorna")
         self.btn_update.setToolTip("Scarica e installa l'ultima versione da Nexus.\n"
                                    "Solo la mod selezionata, o tutte se non c'e' selezione.")
         self.btn_update.clicked.connect(self.do_update)
-        self.btn_save = QPushButton("Salva load order")
+        self.btn_save = QPushButton("Salva")
         self.btn_up.clicked.connect(lambda: self.move_sel(-1))
         self.btn_down.clicked.connect(lambda: self.move_sel(1))
         self.btn_add.clicked.connect(self.add_pak)
@@ -504,13 +1046,16 @@ class MainWindow(QMainWindow):
         m = self.menuBar().addMenu("&File")
         a = QAction("Ricarica", self); a.setShortcut(QKeySequence("F5"))
         a.triggered.connect(self.reload); m.addAction(a)
-        a = QAction("Salva load order", self); a.setShortcut(QKeySequence.Save)
+        a = QAction("Salva", self); a.setShortcut(QKeySequence.Save)
         a.triggered.connect(self.save); m.addAction(a)
         m.addSeparator()
         a = QAction("Cartella di gioco...", self)
         a.triggered.connect(self.change_game_dir); m.addAction(a)
         a = QAction("Ripristina backup...", self)
         a.triggered.connect(self.restore_backup); m.addAction(a)
+        m.addSeparator()
+        a = QAction("Cambia gioco...", self)
+        a.triggered.connect(self.change_game); m.addAction(a)
         m.addSeparator()
         a = QAction("Esci", self); a.setShortcut(QKeySequence.Quit)
         a.triggered.connect(self.close); m.addAction(a)
@@ -519,7 +1064,7 @@ class MainWindow(QMainWindow):
         a = QAction("Imposta API key...", self)
         a.triggered.connect(self.set_apikey); n.addAction(a)
         a = QAction("Identifica mod via hash MD5...", self)
-        a.setToolTip("Cerca su Nexus le mod non ancora associate, usando l'hash del .pak")
+        a.setToolTip("Cerca su Nexus le mod non ancora associate, usando l'hash del file")
         a.triggered.connect(self.discover_nexus); n.addAction(a)
         a = QAction("Associa a Nexus la mod selezionata...", self)
         a.setShortcut(QKeySequence("Ctrl+F"))
@@ -533,17 +1078,23 @@ class MainWindow(QMainWindow):
 
     # ----------------------------------------------------------- dati ---
     def reload(self):
-        self.state, errors = core.build_state()
+        self.state, errors = self.adapter.build_state()
         self.nexus_status = {}
         self.dirty = False
         self.refresh_key_button()
         self.refresh_account()
+        self.apply_adapter_ui()
         self.refresh_table()
         n_on = len([m for m in self.state if m.enabled])
         msg = f"{n_on} mod attive su {len(self.state)}"
         if errors:
             msg += f" - {len(errors)} avvisi: " + "; ".join(errors)
         self.statusBar().showMessage(msg)
+
+    def apply_adapter_ui(self):
+        """Mostra/nasconde le azioni che non tutti i giochi sanno fare."""
+        self.btn_up.setVisible(self.adapter.supports_reorder)
+        self.btn_down.setVisible(self.adapter.supports_reorder)
 
     def refresh_key_button(self):
         """Mostra sul pulsante se la API key c'e' o manca."""
@@ -603,7 +1154,7 @@ class MainWindow(QMainWindow):
                 if off == COL_NEXUS and text.startswith("aggiornamento"):
                     it.setForeground(QColor("#ddaa33"))
                 self.table.setItem(row, off, it)
-        self.setWindowTitle("pakrat" + (" *" if self.dirty else ""))
+        self.setWindowTitle(f"pakrat - {self.adapter.label}" + (" *" if self.dirty else ""))
 
     def sel_row(self):
         r = self.table.currentRow()
@@ -632,13 +1183,13 @@ class MainWindow(QMainWindow):
 
     def add_pak(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Scegli un .pak", os.path.expanduser("~/Downloads"),
-            "Mod BG3 (*.pak)")
+            self, self.adapter.add_dialog_title, os.path.expanduser("~/Downloads"),
+            self.adapter.file_filter)
         if path:
             self.install(path)
 
     def install(self, path):
-        ok, res = core.install_pak(path)
+        ok, res = self.adapter.install_pak(path)
         self.statusBar().showMessage(res)
         if ok:
             self.reload()
@@ -658,22 +1209,22 @@ class MainWindow(QMainWindow):
             self.dirty = True
             self.refresh_table()
             return
-        if QMessageBox.question(
-                self, "Eliminare la mod?",
-                f"Verra' cancellato il file:\n{m.pak}\n\nProcedere?") != QMessageBox.Yes:
+        need_confirm, question = self.adapter.remove_confirm(m)
+        if need_confirm and QMessageBox.question(
+                self, "Rimuovere la mod?", question) != QMessageBox.Yes:
             return
-        try:
-            os.remove(m.pak)
-        except OSError as ex:
-            QMessageBox.critical(self, "Errore", str(ex))
+        ok, msg = self.adapter.remove(m)
+        if not ok:
+            QMessageBox.critical(self, "Errore", msg)
             return
         self.state.pop(r)
-        self.dirty = True
+        if self.adapter.removal_needs_save:
+            self.dirty = True
         self.refresh_table()
-        self.statusBar().showMessage(f"eliminato {m.name}")
+        self.statusBar().showMessage(msg)
 
     def save(self):
-        ok, res = core.write_modsettings(self.state)
+        ok, res = self.adapter.write_state(self.state)
         if ok:
             self.dirty = False
             self.refresh_table()
@@ -682,24 +1233,57 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Non salvato", res)
 
     def change_game_dir(self):
-        dlg = SetupDialog(self)
-        if dlg.exec() == QDialog.Accepted and dlg.chosen:
+        if self.adapter.run_setup(self):
             self.reload()
-            self.statusBar().showMessage(f"cartella di gioco: {dlg.chosen}")
+            self.statusBar().showMessage(f"cartella di gioco aggiornata ({self.adapter.label})")
+
+    def change_game(self):
+        if self.worker and self.worker.isRunning():
+            QMessageBox.information(
+                self, "pakrat",
+                "C'e' un'operazione in corso: attendi che finisca prima di cambiare gioco.")
+            return
+        if self.dirty:
+            r = QMessageBox.question(
+                self, "Modifiche non salvate",
+                "Ci sono modifiche non salvate.\nSalvare prima di cambiare gioco?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+            if r == QMessageBox.Cancel:
+                return
+            if r == QMessageBox.Save:
+                self.save()
+                if self.dirty:
+                    # save() ha mostrato l'errore: si resta sul gioco di
+                    # prima invece di buttare via le modifiche non salvate
+                    return
+        dlg = ChooseGameDialog(self)
+        if dlg.exec() == QDialog.Accepted and dlg.chosen:
+            new_adapter = dlg.chosen
+            if not new_adapter.is_configured() and not new_adapter.run_setup(self):
+                # rifiutato/annullato: si resta sul gioco di prima, che ha
+                # ancora tutto il suo stato caricato in tabella
+                return
+            self.adapter = new_adapter
+            self.reload()
 
     def restore_backup(self):
-        d = core.BACKUP_DIR
+        if not self.adapter.supports_backup_restore:
+            QMessageBox.information(
+                self, "pakrat",
+                f"Ripristino di backup non disponibile per {self.adapter.label}.")
+            return
+        d = self.adapter.backup_dir()
         if not os.path.isdir(d) or not os.listdir(d):
             QMessageBox.information(self, "pakrat", "Nessun backup disponibile.")
             return
-        files = sorted((f for f in os.listdir(d) if f.startswith("modsettings-")),
+        files = sorted((f for f in os.listdir(d) if f.startswith(self.adapter.backup_prefix)),
                        reverse=True)
         item, ok = QInputDialog.getItem(self, "Ripristina backup",
                                         "Backup da ripristinare:", files, 0, False)
         if ok and item:
             import shutil
-            core.backup_modsettings()
-            shutil.copy2(os.path.join(d, item), core.MODSETTINGS)
+            self.adapter.backup_now()
+            shutil.copy2(os.path.join(d, item), self.adapter.modsettings_path())
             self.reload()
             self.statusBar().showMessage(f"ripristinato {item}")
 
@@ -733,31 +1317,24 @@ class MainWindow(QMainWindow):
         if not ok or not ref.strip():
             return
         try:
-            nid = core.parse_nexus_ref(ref)
+            nid = self.adapter.link(m, ref.strip())
         except core.NexusError as ex:
             QMessageBox.warning(self, "pakrat", str(ex))
             return
-        cfg = core.load_config()
-        cfg["mods"].setdefault(m.uuid, {}).update({"nexus_id": nid, "name": m.name})
-        core.save_config(cfg)
         self.nexus_status[m.uuid] = f"id {nid}"
         self.refresh_table()
 
     def browse_nexus(self):
         """Apre Nexus: la pagina della mod selezionata se associata, altrimenti
-        l'elenco mod di Baldur's Gate 3."""
-        url = "https://www.nexusmods.com/baldursgate3/mods/"
-        what = "elenco mod di BG3"
+        l'elenco mod del gioco corrente."""
+        url = self.adapter.mods_list_url()
+        what = f"elenco mod di {self.adapter.label}"
         r = self.sel_row()
         if r >= 0:
             m = self.state[r]
-            try:
-                cfg = core.load_config()
-            except SystemExit:
-                cfg = {"mods": {}}
-            nid = cfg.get("mods", {}).get(m.uuid, {}).get("nexus_id")
+            nid = self.adapter.link_info(m)
             if nid:
-                url = f"https://www.nexusmods.com/baldursgate3/mods/{nid}"
+                url = self.adapter.mod_url(nid)
                 what = m.name
         if not QDesktopServices.openUrl(QUrl(url)):
             QMessageBox.warning(self, "pakrat",
@@ -812,7 +1389,6 @@ class MainWindow(QMainWindow):
 
     def update_via_browser(self, pool):
         """Percorso per account free: apre le pagine di download delle mod."""
-        cfg = core.load_config()
         if not os.path.exists(os.path.expanduser(
                 "~/.local/share/applications/pakrat-nxm.desktop")):
             r = QMessageBox.question(
@@ -821,14 +1397,15 @@ class MainWindow(QMainWindow):
                 "Lo registro adesso?")
             if r == QMessageBox.Yes:
                 self.install_handler()
+        links = self.adapter.link_info_bulk(pool)
         opened = 0
         for m in pool[:5]:          # non sommergere l'utente di schede
-            nid = cfg["mods"].get(m.uuid, {}).get("nexus_id")
+            nid = links.get(m.uuid)
             if not nid:
                 continue
-            QDesktopServices.openUrl(QUrl(core.mod_file_page_url(nid)))
+            QDesktopServices.openUrl(QUrl(self.adapter.mod_page_url(nid)))
             opened += 1
-        rest = max(0, len([m for m in pool if cfg["mods"].get(m.uuid, {}).get("nexus_id")]) - opened)
+        rest = max(0, len([m for m in pool if links.get(m.uuid)]) - opened)
         msg = (f"aperte {opened} pagine: clicca 'Mod Manager Download' su ciascuna, "
                "il resto e' automatico")
         if rest:
@@ -849,31 +1426,30 @@ class MainWindow(QMainWindow):
             return
         r = self.sel_row()
         sel = self.state[r] if r >= 0 else None
-        if sel is not None and cfg["mods"].get(sel.uuid, {}).get("nexus_id"):
+        if sel is not None and self.adapter.link_info(sel):
             pool, what = [sel], f"'{sel.name}'"
         else:
-            pool = [m for m in self.state
-                    if m.has_pak and cfg["mods"].get(m.uuid, {}).get("nexus_id")]
+            candidates = [m for m in self.state if m.has_pak]
+            links = self.adapter.link_info_bulk(candidates)
+            pool = [m for m in candidates if links.get(m.uuid)]
             what = f"tutte le {len(pool)} mod associate"
         if not pool:
             QMessageBox.information(
                 self, "pakrat",
-                "Nessuna mod associata a Nexus.\nUsa 'Associa a Nexus...' per collegarle.")
+                "Nessuna mod associata a Nexus.\nUsa 'Associa per ID/URL...' per collegarle.")
             return
         if not self.account.get("is_premium", False):
             self.update_via_browser(pool)
             return
         if QMessageBox.question(
                 self, "Aggiornare?",
-                f"Scarico e installo l'ultima versione di {what}.\n\n"
-                "Il .pak esistente viene sostituito solo se quello scaricato ha lo\n"
-                "stesso UUID, cosi' il load order resta valido.\n\nProcedere?"
+                f"Scarico e installo l'ultima versione di {what}.\n\nProcedere?"
         ) != QMessageBox.Yes:
             return
         self.btn_update.setEnabled(False)
         self.btn_check.setEnabled(False)
         self.statusBar().showMessage("aggiornamento in corso...")
-        self.worker = UpdateWorker(pool)
+        self.worker = AdapterWorker(self.adapter, "update_all", pool)
         self.worker.row_done.connect(self.on_row_done)
         self.worker.finished_all.connect(self.on_update_done)
         self.worker.start()
@@ -898,6 +1474,12 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "pakrat",
                                     "I moduli base del gioco non stanno su Nexus.")
             return
+        if not self.adapter.supports_match:
+            QMessageBox.information(
+                self, "pakrat",
+                f"Associazione automatica non disponibile per {self.adapter.label}.\n"
+                "Usa 'Associa per ID/URL...'.")
+            return
         try:
             cfg = core.load_config()
         except SystemExit as ex:
@@ -906,15 +1488,10 @@ class MainWindow(QMainWindow):
         if not cfg["nexus_api_key"]:
             QMessageBox.information(self, "pakrat", "Prima imposta la API key Nexus.")
             return
-        dlg = MatchDialog(self, m, cfg["nexus_api_key"])
+        dlg = MatchDialog(self, self.adapter, m, cfg["nexus_api_key"])
         if dlg.exec() == QDialog.Accepted and dlg.chosen:
             c = dlg.chosen
-            cfg = core.load_config()
-            cfg["mods"].setdefault(m.uuid, {}).update(
-                {"nexus_id": c["modId"], "name": m.name,
-                 "installed_version": m.version,
-                 "remote_version": (c.get("version") or "").strip()})
-            core.save_config(cfg)
+            self.adapter.set_link(m, c["modId"], (c.get("version") or "").strip())
             self.nexus_status[m.uuid] = f"id {c['modId']}"
             self.refresh_table()
             self.statusBar().showMessage(f"{m.name} associata a mods/{c['modId']}")
@@ -922,6 +1499,11 @@ class MainWindow(QMainWindow):
     def discover_nexus(self):
         """Identifica via MD5 le mod non ancora associate a Nexus."""
         if self.worker and self.worker.isRunning():
+            return
+        if not self.adapter.supports_discover:
+            QMessageBox.information(
+                self, "pakrat",
+                f"Identificazione via MD5 non disponibile per {self.adapter.label}.")
             return
         try:
             cfg = core.load_config()
@@ -932,9 +1514,9 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "pakrat",
                                     "Prima imposta la API key Nexus.")
             return
-        todo = [m for m in self.state
-                if m.has_pak and not m.is_base
-                and not cfg["mods"].get(m.uuid, {}).get("nexus_id")]
+        candidates = [m for m in self.state if m.has_pak and not m.is_base]
+        links = self.adapter.link_info_bulk(candidates)
+        todo = [m for m in candidates if not links.get(m.uuid)]
         if not todo:
             QMessageBox.information(self, "pakrat",
                                     "Tutte le mod con un .pak sono gia' associate.")
@@ -949,7 +1531,7 @@ class MainWindow(QMainWindow):
             return
         self.btn_check.setEnabled(False)
         self.statusBar().showMessage("identificazione in corso...")
-        self.worker = DiscoverWorker(todo)
+        self.worker = AdapterWorker(self.adapter, "discover_all", todo)
         self.worker.row_done.connect(self.on_row_done)
         self.worker.finished_all.connect(self.on_check_done)
         self.worker.start()
@@ -959,7 +1541,7 @@ class MainWindow(QMainWindow):
             return
         self.btn_check.setEnabled(False)
         self.statusBar().showMessage("controllo aggiornamenti in corso...")
-        self.worker = CheckWorker(list(self.state))
+        self.worker = AdapterWorker(self.adapter, "check_updates", list(self.state))
         self.worker.row_done.connect(self.on_row_done)
         self.worker.finished_all.connect(self.on_check_done)
         self.worker.start()
@@ -981,20 +1563,20 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------ drag & drop ---
     def dragEnterEvent(self, e):
         if e.mimeData().hasUrls() and any(
-                u.toLocalFile().lower().endswith(".pak") for u in e.mimeData().urls()):
+                self.adapter.is_installable(u.toLocalFile()) for u in e.mimeData().urls()):
             e.acceptProposedAction()
 
     def dropEvent(self, e):
         for u in e.mimeData().urls():
             p = u.toLocalFile()
-            if p.lower().endswith(".pak"):
+            if self.adapter.is_installable(p):
                 self.install(p)
 
     def closeEvent(self, e):
         if self.dirty:
             r = QMessageBox.question(
                 self, "Modifiche non salvate",
-                "Il load order e' stato modificato ma non salvato.\nSalvare prima di uscire?",
+                "Ci sono modifiche non salvate.\nSalvare prima di uscire?",
                 QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
             if r == QMessageBox.Cancel:
                 e.ignore()
@@ -1007,12 +1589,16 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("pakrat")
-    if not core.LARIAN or not os.path.isdir(core.LARIAN):
-        # primo avvio, o installazione spostata: chiedi dov'e' il gioco
-        dlg = SetupDialog()
-        if dlg.exec() != QDialog.Accepted:
-            return 1
-    w = MainWindow()
+    # Niente piu' default a BG3: con tre giochi gestiti, chi ha solo MW5 o
+    # Cyberpunk configurati non deve vedersi rifiutare l'avvio perche' BG3
+    # non e' installato (era il bug corretto in 7e981be per la CLI).
+    gdlg = ChooseGameDialog()
+    if gdlg.exec() != QDialog.Accepted or not gdlg.chosen:
+        return 1
+    adapter = gdlg.chosen
+    if not adapter.is_configured() and not adapter.run_setup():
+        return 1
+    w = MainWindow(adapter)
     w.show()
     if os.environ.get("PAKRAT_SCREENSHOT"):
         from PySide6.QtCore import QTimer

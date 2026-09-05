@@ -809,41 +809,20 @@ def remote_version(info):
 
 
 def _vkey(v):
-    """Chiave d'ordinamento tollerante per versioni tipo '2.1a', '0.98.5', '4.0'."""
-    out = []
-    for tok in re.findall(r'\d+|[A-Za-z]+', str(v or "")):
-        out.append((0, int(tok), "") if tok.isdigit() else (1, 0, tok.lower()))
-    return out
+    """Chiave d'ordinamento tollerante per versioni. Condivisa col core: vedi
+    version_key() li' per i dettagli, uguali per MW5 e Cyberpunk."""
+    return core().version_key(v)
 
 
 def usable_files(files):
-    return [f for f in files
-            if str(f.get("category_name") or "").upper() not in ("OLD_VERSION", "ARCHIVED")]
-
-
-_VER_IN_NAME = re.compile(r'(?<![a-z0-9])v?\d+(?:[._-]\d+)+[a-z]?(?![a-z0-9])', re.I)
+    return core().usable_files(files)
 
 
 def _variant_key(name):
-    """Nome del file senza la versione, per raggruppare le release di una variante.
-
-    Molti autori mettono la versione nel nome del file ("Mod (CET) 3.0.4"), e
-    confrontare i nomi tali e quali metteva ogni release in una variante a se':
-    il target del confronto tornava a essere il file installato e nessun
-    aggiornamento risultava mai disponibile. Si toglie solo la versione
-    *punteggiata* (3.0.4, v1_2, 2-1-0); un numero singolo resta, perche' li'
-    distingue varianti parallele vere ("pack 1" / "pack 2", FFPP / FFPP2), che non
-    sono l'una l'aggiornamento dell'altra.
-
-    Limite accettato: se la cifra punteggiata nel nome e' la versione del *gioco*
-    e non della mod -- l'autore pubblica "MyMod 2.12" e "MyMod 2.21" come file
-    paralleli per due patch -- i due finiscono nello stesso gruppo e il piu' alto
-    passa per aggiornamento dell'altro. E' lo scambio di variante che il confronto
-    per nome esatto evitava; si e' scelto di correre il rischio perche' la versione
-    nel nome del file e' molto piu' comune del versionamento per patch di gioco.
-    """
-    s = _VER_IN_NAME.sub(" ", str(name or "").strip().lower())
-    return re.sub(r'[\s_.-]+', " ", s).strip()
+    """Nome del file senza la versione, per raggruppare le release di una
+    variante. Condivisa col core (variant_key()): stessa logica di Cyberpunk,
+    stesso motivo (vedi il docstring li')."""
+    return core().variant_key(name)
 
 
 def remote_status(files, entry):
@@ -872,6 +851,19 @@ def remote_status(files, entry):
         f = core().pick_main_file(us)
         return "gone", f, (f.get("version") or "").strip(), \
             "il file installato non e' piu' su Nexus"
+    # la variante e' solo nome-senza-versione: la categoria NON entra nella
+    # scelta del target di aggiornamento. Restringere per categoria sembrava
+    # giusto (MAIN e OPTIONAL paralleli non sono l'uno l'aggiornamento
+    # dell'altro), ma due file che condividono lo stesso nome ripulito e
+    # differiscono solo per categoria sono quasi sempre lo stesso contenuto nel
+    # tempo -- un autore che pubblica varianti davvero parallele le nomina
+    # diversamente ("with portraits" / "without portraits"), e allora
+    # _variant_key le separa gia' da sole. Il caso che la categoria dovrebbe
+    # proteggere non si presenta mai; quello che rompe (un file ricategorizzato
+    # fra una release e l'altra, es. MAIN -> UPDATE, sparisce come aggiornamento)
+    # si presenta eccome. Stessa logica di variant_key: si preferisce rischiare
+    # uno scambio di variante piuttosto che perdere aggiornamenti in silenzio.
+    cat = str(inst.get("category_name") or "").upper()
     key = _variant_key(inst.get("name"))
     same = [f for f in us if _variant_key(f.get("name")) == key] or [inst]
     target = max(same, key=lambda f: _vkey(f.get("version")))
@@ -881,7 +873,6 @@ def remote_status(files, entry):
         return "update", target, tv, ""
     # varianti = altri file della STESSA categoria alla stessa versione. I
     # "Source files" stanno in MISCELLANEOUS e non sono alternative giocabili.
-    cat = str(inst.get("category_name") or "").upper()
     others = [f for f in us if f.get("file_id") != fid
               and str(f.get("category_name") or "").upper() == cat
               and _vkey(f.get("version")) == _vkey(iv)]

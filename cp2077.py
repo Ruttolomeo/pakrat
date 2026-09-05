@@ -167,11 +167,34 @@ CPM_INIT = "character preset manager (cet)/init.lua"
 CPM_MOD_ID = 31886
 
 
+def _exists_ci(base, *parts):
+    """os.path.exists confrontando ogni segmento senza guardare il case.
+
+    Il nome della cartella di una mod arriva da un archivio di terze parti e
+    non e' garantito avere lo stesso case scritto qui: su un filesystem
+    case-sensitive un confronto letterale puo' dare un falso 'non installato'
+    anche a mod installata (e' la stessa ragione per cui install_archive
+    confronta i percorsi scritti in minuscolo, vedi CPM_DIR/CPM_INIT).
+    """
+    cur = base
+    for part in parts:
+        if not os.path.isdir(cur):
+            return False
+        want = part.lower()
+        try:
+            match = next((e for e in os.listdir(cur) if e.lower() == want), None)
+        except OSError:
+            return False
+        if match is None:
+            return False
+        cur = os.path.join(cur, match)
+    return os.path.exists(cur)
+
+
 def cpm_present(install):
     """True se Character Preset Manager risulta installato sul disco."""
-    return os.path.exists(os.path.join(
-        install, "bin", "x64", "plugins", "cyber_engine_tweaks", "mods",
-        "Character Preset Manager (CET)", "init.lua"))
+    return _exists_ci(install, "bin", "x64", "plugins", "cyber_engine_tweaks",
+                      "mods", "Character Preset Manager (CET)", "init.lua")
 
 
 # Da dove si prendono i core mod. NON da Nexus: sono tutti progetti open source
@@ -521,12 +544,19 @@ class Mod:
         return [f for f in self.files
                 if f.lower().endswith(".archive") and f.replace(os.sep, "/").startswith(pre)]
 
-    def missing(self, install):
-        """File del manifest che non sono dove dovrebbero essere."""
+    def missing(self, install, ns=None):
+        """File del manifest che non sono dove dovrebbero essere.
+
+        I file persi a favore di un'altra mod (overridden_files) non contano:
+        set_enabled/remove_mod li lasciano apposta dove sono, non li spostano
+        nello store delle disattivate, perche' non sono piu' nostri.
+        """
         base = install if self.enabled else store_dir(install, "disattivate/" + self.slug)
         if not base:
             return list(self.files)
-        return [f for f in self.files if not os.path.exists(os.path.join(base, f))]
+        skip = overridden_files(self.slug, ns) if ns is not None else set()
+        return [f for f in self.files
+                if f not in skip and not os.path.exists(os.path.join(base, f))]
 
 
 def scan_mods(ns=None):
@@ -1220,41 +1250,20 @@ def mod_page_url(mod_id, file_id=None):
 
 
 def _vkey(v):
-    """Chiave d'ordinamento tollerante per versioni tipo '2.1a', '0.98.5', '4.0'."""
-    out = []
-    for tok in re.findall(r'\d+|[A-Za-z]+', str(v or "")):
-        out.append((0, int(tok), "") if tok.isdigit() else (1, 0, tok.lower()))
-    return out
+    """Chiave d'ordinamento tollerante per versioni. Condivisa col core: vedi
+    version_key() li' per i dettagli, uguali per Cyberpunk e MW5."""
+    return core().version_key(v)
 
 
 def usable_files(files):
-    return [f for f in files
-            if str(f.get("category_name") or "").upper() not in ("OLD_VERSION", "ARCHIVED")]
-
-
-_VER_IN_NAME = re.compile(r'(?<![a-z0-9])v?\d+(?:[._-]\d+)+[a-z]?(?![a-z0-9])', re.I)
+    return core().usable_files(files)
 
 
 def _variant_key(name):
-    """Nome del file senza la versione, per raggruppare le release di una variante.
-
-    Molti autori mettono la versione nel nome del file ("Mod (CET) 3.0.4"), e
-    confrontare i nomi tali e quali metteva ogni release in una variante a se':
-    il target del confronto tornava a essere il file installato e nessun
-    aggiornamento risultava mai disponibile. Si toglie solo la versione
-    *punteggiata* (3.0.4, v1_2, 2-1-0); un numero singolo resta, perche' li'
-    distingue varianti parallele vere ("pack 1" / "pack 2", FFPP / FFPP2), che non
-    sono l'una l'aggiornamento dell'altra.
-
-    Limite accettato: se la cifra punteggiata nel nome e' la versione del *gioco*
-    e non della mod -- l'autore pubblica "MyMod 2.12" e "MyMod 2.21" come file
-    paralleli per due patch -- i due finiscono nello stesso gruppo e il piu' alto
-    passa per aggiornamento dell'altro. E' lo scambio di variante che il confronto
-    per nome esatto evitava; si e' scelto di correre il rischio perche' la versione
-    nel nome del file e' molto piu' comune del versionamento per patch di gioco.
-    """
-    s = _VER_IN_NAME.sub(" ", str(name or "").strip().lower())
-    return re.sub(r'[\s_.-]+', " ", s).strip()
+    """Nome del file senza la versione, per raggruppare le release di una
+    variante. Condivisa col core (variant_key()): stessa logica di MW5,
+    stesso motivo (vedi il docstring li')."""
+    return core().variant_key(name)
 
 
 def remote_status(files, entry):
@@ -1278,6 +1287,19 @@ def remote_status(files, entry):
         f = core().pick_main_file(us)
         return "gone", f, (f.get("version") or "").strip(), \
             "il file installato non e' piu' su Nexus"
+    # la variante e' solo nome-senza-versione: la categoria NON entra nella
+    # scelta del target di aggiornamento. Restringere per categoria sembrava
+    # giusto (MAIN e OPTIONAL paralleli non sono l'uno l'aggiornamento
+    # dell'altro), ma due file che condividono lo stesso nome ripulito e
+    # differiscono solo per categoria sono quasi sempre lo stesso contenuto nel
+    # tempo -- un autore che pubblica varianti davvero parallele le nomina
+    # diversamente ("con ritratti" / "senza ritratti"), e allora _variant_key
+    # le separa gia' da sole. Il caso che la categoria dovrebbe proteggere non
+    # si presenta mai; quello che rompe (un file ricategorizzato fra una
+    # release e l'altra, es. MAIN -> UPDATE, sparisce come aggiornamento) si
+    # presenta eccome. Stessa logica di variant_key: si preferisce rischiare
+    # uno scambio di variante piuttosto che perdere aggiornamenti in silenzio.
+    cat = str(inst.get("category_name") or "").upper()
     key = _variant_key(inst.get("name"))
     same = [f for f in us if _variant_key(f.get("name")) == key] or [inst]
     target = max(same, key=lambda f: _vkey(f.get("version")))
@@ -1285,7 +1307,6 @@ def remote_status(files, entry):
     tv = (target.get("version") or "").strip()
     if _vkey(tv) > _vkey(iv):
         return "update", target, tv, ""
-    cat = str(inst.get("category_name") or "").upper()
     others = [f for f in us if f.get("file_id") != fid
               and str(f.get("category_name") or "").upper() == cat
               and _vkey(f.get("version")) == _vkey(iv)]
@@ -1343,7 +1364,7 @@ def cmd_list(_args=None):
     print(f"{'#':>3} {'on':^3} {'ord':>4}  {'mod':<32} {'ver':<9} {'file':>5}  tipo")
     for i, m in enumerate(mods, 1):
         o = m.order
-        miss = m.missing(install)
+        miss = m.missing(install, ns)
         warn = f"  ! {len(miss)} file mancanti" if miss else ""
         print(f"{i:>3} {'X' if m.enabled else ' ':^3} {(str(o) if o is not None else '-'):>4}  "
               f"{m.name[:32]:<32} {(m.version or '?')[:9]:<9} {len(m.files):>5}  "
@@ -1605,7 +1626,7 @@ def cmd_verify(_args=None):
     mods = scan_mods(ns)
     problems = 0
     for m in mods:
-        miss = m.missing(install)
+        miss = m.missing(install, ns)
         if miss:
             problems += 1
             print(f"{m.name}: {len(miss)} file mancanti")
