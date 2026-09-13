@@ -678,6 +678,12 @@ class MatchDialog(QDialog):
         self.start_search(None)
 
     def start_search(self, term):
+        if self.worker is not None and self.worker.isRunning():
+            # sostituirlo ora distruggerebbe un QThread in corsa, come faceva
+            # refresh_account(). Il resto della GUI si comporta cosi' quando e'
+            # occupata: si aspetta che finisca invece di sovrapporre due giri
+            self.info.setText("ricerca gia' in corso, attendi...")
+            return
         self.info.setText("ricerca in corso...")
         self.btn_ok.setEnabled(False)
         self.worker = SearchWorker(self.adapter, self.mod, self.api_key, term)

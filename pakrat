@@ -110,7 +110,8 @@ def _steam_libraries():
             continue
         try:
             import re
-            txt = open(vdf, encoding="utf-8", errors="replace").read()
+            with open(vdf, encoding="utf-8", errors="replace") as f:
+                txt = f.read()
             libs += re.findall(r'"path"\s+"([^"]+)"', txt)
         except OSError:
             pass
@@ -510,7 +511,14 @@ def install_pak(src):
     dest = os.path.join(MODS_DIR, os.path.basename(src))
     if os.path.exists(dest):
         return False, f"esiste gia': {os.path.basename(dest)}"
-    shutil.copy2(src, dest)
+    # validate_larian_dir accetta una cartella dati senza Mods/ e promette che
+    # verra' creata al primo .pak: senza questo la promessa era falsa e si
+    # usciva con un FileNotFoundError, per giunta non catturato da nessuno
+    try:
+        os.makedirs(MODS_DIR, exist_ok=True)
+        shutil.copy2(src, dest)
+    except OSError as ex:
+        return False, f"copia non riuscita: {ex}"
     if m is None:
         return True, f"installato {os.path.basename(dest)} (senza meta.lsx: non va in modsettings)"
     return True, f"installato {m.name} {m.version}"
