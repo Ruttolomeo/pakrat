@@ -1042,6 +1042,28 @@ def variant_key(name):
     return re.sub(r'[\s_.-]+', " ", s).strip()
 
 
+def name_from_archive(path):
+    """Nome mod ricavato dal file scaricato, ripulito dal codice Nexus.
+
+    Nexus consegna 'Nome Mod-4523-1-2-1699999999.zip': la coda e' id, versione e
+    timestamp, e non fa parte del nome. Quel che resta e' stabile fra una
+    release e l'altra, che e' la ragione per cui si usa questo e non il
+    displayName dichiarato nel mod.json: quello l'autore lo cambia quando gli
+    pare, e un nome che cambia vuol dire una SECONDA cartella installata
+    accanto alla prima invece di un aggiornamento.
+
+    Condivisa fra Cyberpunk (slug della mod) e MW5 (nome della cartella,
+    quando l'archivio non ne porta una propria).
+    """
+    import re
+    base = os.path.basename(path)
+    base = re.sub(r'\.(zip|7z|rar|tar\.gz|tgz)$', '', base, flags=re.I)
+    base = re.sub(r'-\d+(-\d+)*-\d{9,}$', '', base)     # -id-ver-timestamp
+    base = re.sub(r'-\d+-\d+(-\d+)*$', '', base)        # -id-ver
+    base = re.sub(r'[\\/:*?"<>|]+', '_', base).strip(" .-_")
+    return base or "mod"
+
+
 def download_url(url, dest, progress=None):
     """Scarica su file temporaneo e rinomina solo a download completo."""
     import urllib.parse
@@ -1247,7 +1269,9 @@ def cmd_update(target=None):
     ok = fail = 0
     for m in pool:
         print(f"{m.name}")
-        good, res = update_mod(m, cfg["mods"][m.uuid], cfg["nexus_api_key"])
+        # .get e non [...]: con un indice si puo' indicare una mod che non e'
+        # associata a Nexus, e update_mod sa gia' rispondere "non associata"
+        good, res = update_mod(m, cfg["mods"].get(m.uuid, {}), cfg["nexus_api_key"])
         print(f"  {res}")
         ok += good
         fail += not good
@@ -1719,6 +1743,10 @@ LOG_ERR_PATTERN = r"\b(error|errore|failed|failure|exception|panic|fatal)\b"
 # tutti nei primi secondi di avvio.
 LOG_RUN_WINDOW = 300
 
+# Quanta coda di un log si legge davvero dal disco. Abbondante per le 400 righe
+# che si tengono, e con un tetto perche' il file all'altro capo non ce l'ha.
+LOG_TAIL_BYTES = 1 << 20
+
 
 def log_age(ts, now=None):
     """'3 min fa'. Un'ora esatta non serve a nessuno, l'ordine di grandezza si."""
@@ -1754,10 +1782,18 @@ def scan_logs(base, dirs, err_re=None, tail=400):
                 full = os.path.join(root, fn)
                 try:
                     st = os.stat(full)
-                    with open(full, "r", errors="replace") as fh:
-                        lines = fh.readlines()[-tail:]
+                    with open(full, "rb") as fh:
+                        # ci si posiziona in fondo invece di leggere tutto:
+                        # readlines() caricava in memoria l'intero log per
+                        # tenerne 400 righe, e un log di gioco puo' essere
+                        # di gigabyte
+                        if st.st_size > LOG_TAIL_BYTES:
+                            fh.seek(-LOG_TAIL_BYTES, os.SEEK_END)
+                            fh.readline()          # la prima riga e' tronca
+                        data = fh.read()
                 except OSError:
                     continue
+                lines = data.decode("utf-8", "replace").splitlines()[-tail:]
                 rel = os.path.relpath(full, base)
                 if rel.startswith(".."):        # cartella fuori dall'installazione
                     rel = full
@@ -1891,13 +1927,19 @@ def tui(stdscr):
         except KeyboardInterrupt:
             break
         if c in (ord("q"), 27):
-            if dirty:
-                msg = "ci sono modifiche non salvate: w per salvare, Q per uscire comunque"
+            if dirty and dirty != "asked":
+                # 'asked' e' l'avviso gia' dato: la q successiva esce. Qualunque
+                # modifica nel frattempo rimette dirty a True e riarma l'avviso
+                msg = ("modifiche non salvate: w per salvare, "
+                       "q di nuovo (o Q) per uscire comunque")
                 dirty = "asked"
                 continue
             break
         if c == ord("Q"):
             break
+        if not state and c in (ord(" "), ord("d"), ord("J"), ord("K")):
+            msg = "nessuna mod: non c'e' niente da spostare ne' da togliere"
+            continue
         if c in (ord("j"), curses.KEY_DOWN):
             sel = min(len(state) - 1, sel + 1)
         elif c in (ord("k"), curses.KEY_UP):
@@ -1932,7 +1974,7 @@ def tui(stdscr):
                 dirty = False
         elif c == ord("r"):
             state, errors = build_state()
-            sel = min(sel, len(state) - 1)
+            sel = max(0, min(sel, len(state) - 1))
             dirty = False
             msg = "ricaricato"
         elif c == ord("e"):
@@ -2278,6 +2320,9 @@ def cmd_backups():
 
 
 def cmd_restore(n):
+    if not os.path.isdir(BACKUP_DIR):
+        print("nessun backup da ripristinare")
+        return 1
     files = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith("modsettings-"))
     try:
         src = os.path.join(BACKUP_DIR, files[int(n) - 1])

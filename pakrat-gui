@@ -1145,15 +1145,48 @@ class MainWindow(QMainWindow):
                 it = QTableWidgetItem(text)
                 if off in (COL_NUM, COL_VER):
                     it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if m.is_base:
-                    it.setForeground(QColor("#6699cc"))
-                elif m.enabled and not m.has_pak:
-                    it.setForeground(QColor("#cc5555"))
-                elif not m.enabled:
-                    it.setForeground(QColor("#999999"))
-                if off == COL_NEXUS and text.startswith("aggiornamento"):
-                    it.setForeground(QColor("#ddaa33"))
                 self.table.setItem(row, off, it)
+            self._paint_row(row, m, num)
+        self.setWindowTitle(f"pakrat - {self.adapter.label}" + (" *" if self.dirty else ""))
+
+    def _paint_row(self, row, m, num):
+        """Numero di posizione e colori di una riga gia' costruita."""
+        col = None
+        if m.is_base:
+            col = QColor("#6699cc")
+        elif m.enabled and not m.has_pak:
+            col = QColor("#cc5555")
+        elif not m.enabled:
+            col = QColor("#999999")
+        for off in range(COL_NUM, len(HEADERS)):
+            it = self.table.item(row, off)
+            if it is None:
+                continue
+            if off == COL_NUM:
+                it.setText(num)
+            if off == COL_NEXUS and it.text().startswith("aggiornamento"):
+                it.setForeground(QColor("#ddaa33"))
+            elif col is not None:
+                it.setForeground(col)
+            else:
+                it.setData(Qt.ForegroundRole, None)   # torna al colore di sistema
+
+    def renumber(self):
+        """Ricalcola '#' e i colori senza ricostruire la tabella.
+
+        refresh_table() ricrea il widget di ogni riga: chiamarlo dallo slot di
+        un checkbox distrugge il checkbox che ha appena emesso il segnale,
+        mentre si e' ancora dentro la sua chiamata, e rifa n righe per una
+        spunta sola.
+        """
+        pos = 0
+        for row, m in enumerate(self.state):
+            if m.enabled:
+                pos += 1
+                num = str(pos)
+            else:
+                num = "-"
+            self._paint_row(row, m, num)
         self.setWindowTitle(f"pakrat - {self.adapter.label}" + (" *" if self.dirty else ""))
 
     def sel_row(self):
@@ -1164,7 +1197,7 @@ class MainWindow(QMainWindow):
     def toggle(self, mod, st):
         mod.enabled = bool(st)
         self.dirty = True
-        self.refresh_table()
+        self.renumber()
 
     def move_sel(self, delta):
         r = self.sel_row()
@@ -1357,6 +1390,8 @@ class MainWindow(QMainWindow):
             self.account = {}
             self.apply_account()
             return
+        if self.acct_worker is not None and self.acct_worker.isRunning():
+            return          # sostituirlo ora distruggerebbe un QThread in corsa
         self.acct_worker = AccountWorker(cfg["nexus_api_key"])
         self.acct_worker.done.connect(self.on_account)
         self.acct_worker.start()
@@ -1583,6 +1618,11 @@ class MainWindow(QMainWindow):
                 return
             if r == QMessageBox.Save:
                 self.save()
+                if self.dirty:
+                    # save() ha gia' mostrato l'errore: chiudere adesso
+                    # butterebbe via proprio le modifiche che non ha scritto
+                    e.ignore()
+                    return
         e.accept()
 
 

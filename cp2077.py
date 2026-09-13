@@ -556,7 +556,8 @@ class Mod:
             return list(self.files)
         skip = overridden_files(self.slug, ns) if ns is not None else set()
         return [f for f in self.files
-                if f not in skip and not os.path.exists(os.path.join(base, f))]
+                if _norm(f) not in skip
+                and not os.path.exists(os.path.join(base, f))]
 
 
 def scan_mods(ns=None):
@@ -612,6 +613,16 @@ def _norm(rel):
     return str(rel).replace(os.sep, "/").lower()
 
 
+def _key_of(d, rel):
+    """La chiave di 'd' che corrisponde a quel percorso, confrontata con _norm."""
+    if not d:
+        return None
+    if rel in d:
+        return rel
+    n = _norm(rel)
+    return next((k for k in d if _norm(k) == n), None)
+
+
 def _claimants(rel, ns):
     """Le mod (non archiviate) che dichiarano di aver installato un file."""
     rel = _norm(rel)
@@ -657,14 +668,20 @@ def owner_of(rel, ns, skip=None):
 
 
 def overridden_files(slug, ns):
-    """I file che 'slug' ha installato ma che ora sono di un'altra mod."""
+    """I percorsi che 'slug' ha installato ma che ora sono di un'altra mod.
+
+    Normalizzati come in _claimants/_losers: il confronto sul percorso qui e'
+    fatto ovunque ignorando separatore e maiuscole, e farlo in un modo solo qui
+    voleva dire che due mod che dichiarano lo stesso file con case diverso
+    risultavano in conflitto per owner_of() e non per chi legge questa.
+    """
     out = set()
     for other, e in (ns.get("mods") or {}).items():
         if other == slug or e.get("removed_at"):
             continue
         for rel, loser in (e.get("overrides") or {}).items():
             if loser == slug:
-                out.add(rel)
+                out.add(_norm(rel))
     return out
 
 
@@ -728,6 +745,8 @@ def _find_game_root(tree):
             elif hl == "red4ext" and os.path.isdir(os.path.join(p, "plugins")):
                 ok = True
             elif hl == "bin" and os.path.isdir(os.path.join(p, "x64")):
+                ok = True
+            elif hl == "engine" and os.path.isdir(os.path.join(p, "config")):
                 ok = True
             elif hl == "mods" and any(
                     os.path.isfile(os.path.join(p, d, "info.json"))
@@ -832,22 +851,16 @@ def plan_install(tree, slug, preset_gender=None):
             kinds.add("redmod")
         elif low.startswith("r6/") or low.startswith("red4ext/") or low.startswith("bin/"):
             kinds.add("script")
+        elif low.startswith("engine/"):
+            kinds.add("config")
     return safe, ignored, sorted(kinds)
 
 
 # ------------------------------------------------------------ installazione ---
 def _slug_from_archive(path):
-    """Nome mod ricavato dal file scaricato, ripulito dal codice Nexus.
-
-    Nexus consegna 'Nome Mod-4523-1-2-1699999999.zip': la coda e' id, versione e
-    timestamp, e non fa parte del nome.
-    """
-    base = os.path.basename(path)
-    base = re.sub(r'\.(zip|7z|rar|tar\.gz|tgz)$', '', base, flags=re.I)
-    base = re.sub(r'-\d+(-\d+)*-\d{9,}$', '', base)     # -id-ver-timestamp
-    base = re.sub(r'-\d+-\d+(-\d+)*$', '', base)        # -id-ver
-    base = re.sub(r'[\\/]+', '_', base).strip(" .-_")
-    return base or "mod"
+    """Nome mod ricavato dal file scaricato. Condivisa col core: vedi
+    name_from_archive() li', stessa logica e stesso motivo di MW5."""
+    return core().name_from_archive(path)
 
 
 def _shadow_dir(slug, create=False):
@@ -855,6 +868,134 @@ def _shadow_dir(slug, create=False):
     if create:
         os.makedirs(p, exist_ok=True)
     return p
+
+
+def _unshadow(slug, install, rels=None, remove=False):
+    """Rimette al loro posto i file che la mod aveva coperto. Ritorna quanti.
+
+    'rels' limita l'operazione a un sottoinsieme: serve all'aggiornamento, che
+    deve restituire solo i file che la versione nuova non porta piu'.
+
+    'remove' butta anche la copia messa da parte, ma SOLO se l'abbiamo davvero
+    rimessa al suo posto: se il file sul disco c'e' gia' vuol dire che nel
+    frattempo se l'e' preso un'altra mod, e la nostra copia e' rimasta l'unico
+    originale di gioco sopravvissuto. Cancellarla la' significa perderlo.
+    """
+    shadow = _shadow_dir(slug)
+    if not os.path.isdir(shadow):
+        return 0
+    want = None if rels is None else {_norm(r) for r in rels}
+    done = 0
+    for rel in _rel_files(shadow):
+        if want is not None and _norm(rel) not in want:
+            continue
+        src = os.path.join(shadow, rel.replace("/", os.sep))
+        dst = os.path.join(install, rel.replace("/", os.sep))
+        if os.path.exists(dst):
+            continue
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        done += 1
+        if remove:
+            try:
+                os.remove(src)
+            except OSError:
+                pass
+    return done
+
+
+def _shadow_heir(rel, slug, ns):
+    """La mod che ha coperto DIRETTAMENTE 'slug' su quel file, o None.
+
+    E' l'inverso di overridden_files: chi ci sta sopra registra noi come
+    perdente, e per quel file custodisce una copia del NOSTRO contenuto.
+    """
+    n = _norm(rel)
+    for other, e in (ns.get("mods") or {}).items():
+        if other == slug or e.get("removed_at"):
+            continue
+        for r, loser in (e.get("overrides") or {}).items():
+            if loser == slug and _norm(r) == n:
+                return other
+    return None
+
+
+def _handover_shadow(slug, rels, ns):
+    """Sistema lo strato di shadow dei file che lasciamo a un'altra mod.
+
+    Ritorna (ceduti, scartati).
+
+    Lo shadow e' una PILA: se A copre un file del gioco e poi B copre A, la
+    copia di A e' l'originale del gioco e quella di B e' il file di A. Quando A
+    esce dalla catena — rimossa, oppure aggiornata a una versione che quel file
+    non lo porta piu' — la copia di B e' il file di una mod che non c'e' piu',
+    e va sostituita con quella di A, che e' l'unico originale rimasto: lo
+    strato di A si schiaccia su quello di B.
+
+    Se sotto di noi non c'era niente (il file l'avevamo portato noi, non
+    coperto) allora non abbiamo uno strato da cedere, e la copia dell'erede
+    resta comunque un file nostro che non serve piu' a nessuno: si butta, cosi'
+    quando anche l'erede se ne andra' il file sparira' invece di riapparire.
+
+    Si cede a chi ci ha coperti DIRETTAMENTE, non a chi sta in cima alla pila:
+    fra noi e la cima possono esserci altri strati, e scavalcarli vorrebbe dire
+    buttare via il loro contenuto.
+    """
+    mods = ns.get("mods") or {}
+    mine = mods.get(slug) or {}
+    ceduti = scartati = 0
+    for rel in rels:
+        heir = _shadow_heir(rel, slug, ns)
+        if heir is None:
+            continue
+        nostro = os.path.join(_shadow_dir(slug), rel.replace("/", os.sep))
+        suo = os.path.join(_shadow_dir(heir), rel.replace("/", os.sep))
+        mio_ov = mine.get("overrides") or {}
+        sotto = mio_ov.get(_key_of(mio_ov, rel))
+        if os.path.isfile(nostro):
+            os.makedirs(os.path.dirname(suo), exist_ok=True)
+            shutil.copy2(nostro, suo)     # quel che c'era li' era roba nostra
+            os.remove(nostro)
+            ceduti += 1
+        else:
+            # non avevamo niente sotto: quello che l'erede custodisce siamo noi
+            if os.path.isfile(suo):
+                os.remove(suo)
+            sotto = None
+            scartati += 1
+
+        # l'erede prende il nostro posto nella catena: sotto di lui c'e' adesso
+        # quello che c'era sotto di noi, mod, file di gioco o niente
+        he = mods.setdefault(heir, {})
+        ov = he.get("overrides") or {}
+        k = _key_of(ov, rel)
+        if k is not None:
+            del ov[k]
+        if sotto is not None:
+            ov[rel] = sotto
+        if ov:
+            he["overrides"] = ov
+        else:
+            he.pop("overrides", None)
+        coperti = set(he.get("shadowed") or [])
+        coperti = (coperti | {rel}) if os.path.isfile(suo) else (coperti - {rel})
+        if coperti:
+            he["shadowed"] = sorted(coperti)
+        else:
+            he.pop("shadowed", None)
+
+        # quello strato noi non lo teniamo piu'
+        k = _key_of(mine.get("overrides"), rel)
+        if k is not None:
+            del mine["overrides"][k]
+            if not mine["overrides"]:
+                mine.pop("overrides", None)
+        resto = sorted(set(mine.get("shadowed") or []) - {rel})
+        if resto:
+            mine["shadowed"] = resto
+        else:
+            mine.pop("shadowed", None)
+    return ceduti, scartati
 
 
 def install_plan(pairs, slug, install, ns, log=print):
@@ -965,14 +1106,29 @@ def install_archive(archive, install=None, enable=True, log=print, slug=None,
         # resta in giro roba della versione vecchia che il gioco carica lo stesso
         # ma non quelli che nel frattempo sono passati a un'altra mod
         lost = overridden_files(slug, ns)
-        stale = [f for f in old_files if f not in written and f not in lost]
+        stale = [f for f in old_files if f not in written and _norm(f) not in lost]
+        # quelli che invece lasciamo a un'altra mod: lo strato di shadow che
+        # tenevamo sotto di loro va ceduto a lei, altrimenti resta a custodire
+        # un file nostro e l'originale del gioco se ne va col nostro shadow
+        ceduti = [f for f in old_files if f not in written and _norm(f) in lost]
+        passati, scartati = _handover_shadow(slug, ceduti, ns)
+        if passati:
+            log(f"  {passati} file di gioco passati alla mod che ora li copre")
+        if scartati:
+            log(f"  {scartati} copie di riserva non piu' utili a nessuno, tolte")
         for rel in stale:
             p = os.path.join(install, rel.replace("/", os.sep))
             if os.path.isfile(p):
                 os.remove(p)
         if stale:
+            # sotto uno di quei file poteva esserci un file di gioco che avevamo
+            # messo da parte all'installazione: cancellare e basta lasciava un
+            # buco che solo 'remove' avrebbe richiuso, e chi aggiorna e non
+            # rimuove mai non lo richiudeva affatto
+            back = _unshadow(slug, install, stale, remove=True)
             _prune_empty(install, stale)
-            log(f"  tolti {len(stale)} file della versione precedente")
+            log(f"  tolti {len(stale)} file della versione precedente"
+                + (f", {back} file di gioco ripristinati" if back else ""))
 
         entry["display_name"] = entry.get("display_name") or slug
         entry["files"] = written
@@ -982,6 +1138,8 @@ def install_archive(archive, install=None, enable=True, log=print, slug=None,
         entry["source_archive"] = os.path.basename(archive)
         if shadowed:
             entry["shadowed"] = sorted(shadowed)
+        else:
+            entry.pop("shadowed", None)
         if overrides:
             entry["overrides"] = overrides
         else:
@@ -1054,7 +1212,7 @@ def set_enabled(slugs, enabled, install=None, log=print):
         lost = overridden_files(slug, ns)
         if lost:
             # se li spostassimo li toglieremmo dal gioco a nome di un'altra mod
-            files = [f for f in files if f not in lost]
+            files = [f for f in files if _norm(f) not in lost]
             log(f"  {slug}: {len(lost)} file lasciati stare (ora di un'altra mod)")
         shadow = store_dir(install, "disattivate/" + slug, create=True)
         if enabled:
@@ -1103,29 +1261,38 @@ def set_order(slug, n, install=None, log=print):
     prefix = "" if n is None else f"{max(0, min(999, int(n))):03d}_"
     files, changed = list(e.get("files") or []), []
     pre = ARCHIVE_MOD_DIR.replace(os.sep, "/") + "/"
-    for i, rel in enumerate(files):
-        low = rel.lower()
-        if not rel.replace(os.sep, "/").startswith(pre):
-            continue                      # i REDmod non si ordinano per nome
-        if not (low.endswith(".archive") or low.endswith(".archive.xl")):
-            continue
-        d, base = os.path.split(rel)
-        new_base = prefix + ORDER_RE.sub("", base)
-        if new_base == base:
-            continue
-        src = os.path.join(install, rel.replace("/", os.sep))
-        dst = os.path.join(install, d.replace("/", os.sep), new_base)
-        if not os.path.exists(src):
-            continue
-        if os.path.exists(dst):
-            raise RuntimeError(f"esiste gia': {os.path.join(d, new_base)}")
-        os.replace(src, dst)
-        files[i] = f"{d}/{new_base}" if d else new_base
-        changed.append((base, new_base))
-    e["files"] = files
-    cfg_save(cfg)
-    for old, new in changed:
-        log(f"  {old} -> {new}")
+    # il salvataggio sta in un finally perche' i rename sono gia' avvenuti sul
+    # disco quando uno di loro fallisce: uscire senza scrivere il manifest lo
+    # lasciava a descrivere nomi di file che non esistono piu', e da li' in poi
+    # 'verify' segnalava file mancanti e 'remove' non trovava piu' niente
+    try:
+        for i, rel in enumerate(files):
+            low = rel.lower()
+            if not rel.replace(os.sep, "/").startswith(pre):
+                continue                  # i REDmod non si ordinano per nome
+            if not (low.endswith(".archive") or low.endswith(".archive.xl")):
+                continue
+            d, base = os.path.split(rel)
+            new_base = prefix + ORDER_RE.sub("", base)
+            if new_base == base:
+                continue
+            src = os.path.join(install, rel.replace("/", os.sep))
+            dst = os.path.join(install, d.replace("/", os.sep), new_base)
+            if not os.path.exists(src):
+                continue
+            if os.path.exists(dst):
+                raise RuntimeError(f"esiste gia': {os.path.join(d, new_base)}")
+            os.replace(src, dst)
+            files[i] = f"{d}/{new_base}" if d else new_base
+            changed.append((base, new_base))
+    finally:
+        e["files"] = files
+        try:
+            cfg_save(cfg)
+        except Exception as ex:           # non deve coprire l'errore vero
+            log(f"  ! manifest non salvato: {ex}")
+        for old, new in changed:
+            log(f"  {old} -> {new}")
     return changed
 
 
@@ -1145,10 +1312,12 @@ def remove_mod(slug, install=None, purge=False, log=print):
         raise RuntimeError(f"mod sconosciuta: {slug}")
     files = list(e.get("files") or [])
     lost = overridden_files(slug, ns)
+    ceduti = []
     if lost:
         # sul disco quei file sono di chi ha vinto il conflitto: toccarli qui
         # vorrebbe dire disinstallare pezzi di un'altra mod
-        files = [f for f in files if f not in lost]
+        ceduti = [f for f in files if _norm(f) in lost]
+        files = [f for f in files if _norm(f) not in lost]
         log(f"  {slug}: {len(lost)} file lasciati stare (ora di un'altra mod)")
     base = install if e.get("enabled", True) else store_dir(install, "disattivate/" + slug)
     if purge:
@@ -1166,18 +1335,18 @@ def remove_mod(slug, install=None, purge=False, log=print):
     _prune_empty(base, files)
     shutil.rmtree(store_dir(install, "disattivate/" + slug), ignore_errors=True)
 
-    # rimettiamo a posto quello che la mod aveva coperto
-    shadow = _shadow_dir(slug)
-    restored = 0
-    if os.path.isdir(shadow):
-        for rel in _rel_files(shadow):
-            d = os.path.join(install, rel.replace("/", os.sep))
-            if not os.path.exists(d):
-                os.makedirs(os.path.dirname(d), exist_ok=True)
-                shutil.copy2(os.path.join(shadow, rel.replace("/", os.sep)), d)
-                restored += 1
-        if purge:
-            shutil.rmtree(shadow, ignore_errors=True)
+    # prima si cede: i file che restano a un'altra mod se li portano dietro lo
+    # strato che tenevamo sotto, se no lo butteremmo qui sotto insieme al resto
+    passati, scartati = _handover_shadow(slug, ceduti, ns)
+    if passati:
+        log(f"  {passati} file di gioco passati alla mod che ora li copre")
+    if scartati:
+        log(f"  {scartati} copie di riserva non piu' utili a nessuno, tolte")
+
+    # poi rimettiamo a posto quello che la mod copriva e nessun altro ha preso
+    restored = _unshadow(slug, install)
+    if purge:
+        shutil.rmtree(_shadow_dir(slug), ignore_errors=True)
     if restored:
         log(f"  {restored} file di gioco ripristinati")
 
@@ -1421,10 +1590,17 @@ def cmd_add(args):
         if gender not in ACU_GENDERS:
             print(f"--preset vuole male o female, non {gender!r}", file=sys.stderr)
             return 1
-    skip = {"--name", name} if name else set()
-    if gender:
-        skip |= {"--preset", gender}
-    files = [a for a in args if not a.startswith("--") and a not in skip]
+    # i file si riconoscono per POSIZIONE: filtrando per valore, un archivio
+    # che si chiama come il nome passato a --name spariva dall'elenco
+    files, i = [], 0
+    while i < len(args):
+        a = args[i]
+        if a in ("--name", "--preset"):
+            i += 2                        # l'opzione e il suo valore
+            continue
+        if not a.startswith("--"):
+            files.append(a)
+        i += 1
     rc, done = 0, []
     for f in files:
         print(f"{os.path.basename(f)}:")
@@ -1542,6 +1718,11 @@ def cmd_remove(args):
             except (EOFError, KeyboardInterrupt):
                 print()
                 return 1
+        else:
+            # da script il comando piu' distruttivo dei due non passa: e' quello
+            # che fa gia' il backend MW5, e qui cancellava senza chiedere niente
+            print("nessun terminale per confermare: annullato", file=sys.stderr)
+            return 1
     rc = 0
     for m in targets:
         print(f"{m.name}:")
@@ -1657,7 +1838,7 @@ def cmd_verify(_args=None):
         problems += 1
     if not problems:
         print(f"tutto a posto: {len(mods)} mod, manifest coerente col disco")
-    return 0
+    return 1 if problems else 0
 
 
 def offer_bootstrap(missing, install=None):
@@ -2422,17 +2603,25 @@ def cmd_get(args):
         return 1
     ids = []
     for ref in refs:
-        mod_id = parse_ref(ref)
-        if not mod_id:
-            print(f"non e' un ID o un URL di mod: {ref}", file=sys.stderr)
+        try:
+            mod_id = parse_ref(ref)
+        except c.NexusError as ex:
+            print(str(ex), file=sys.stderr)
             return 1
         ids.append(mod_id)
+    # --file vale per la mod che l'utente ha chiesto, e resta valido anche se
+    # --with-reqs allunga la lista: legarlo a len(ids) lo faceva sparire in
+    # silenzio appena entrava in gioco un prerequisito
+    chiesto = ids[0] if len(ids) == 1 else None
+    if file_id and chiesto is None:
+        print("--file vale per un ID solo: lo ignoro", file=sys.stderr)
+        file_id = None
     if "--with-reqs" in args:
         ids = expand_reqs(ids, api_key, install)
     rc, done = 0, []
     for mod_id in ids:
         slug, err = fetch_and_install(mod_id, api_key, install, enable=enable,
-                                      file_id=file_id if len(ids) == 1 else None)
+                                      file_id=file_id if mod_id == chiesto else None)
         if err:
             print(f"  {err}", file=sys.stderr)
             rc = 1
@@ -2798,9 +2987,10 @@ def cmd_reqs(args):
     if not args:
         print("uso: pakrat cp2077 reqs ID|URL", file=sys.stderr)
         return 1
-    mod_id = parse_ref(args[0])
-    if not mod_id:
-        print(f"non e' un ID o un URL di mod: {args[0]}", file=sys.stderr)
+    try:
+        mod_id = parse_ref(args[0])
+    except core().NexusError as ex:
+        print(str(ex), file=sys.stderr)
         return 1
     api_key = core().load_config().get("nexus_api_key")
     if not api_key:
@@ -3010,7 +3200,10 @@ def cmd_body(args):
     if ref.isdigit() and 1 <= int(ref) <= len(BODIES):
         b = BODIES[int(ref) - 1]
     else:
-        mid = parse_ref(ref)
+        try:
+            mid = parse_ref(ref)
+        except core().NexusError:
+            mid = 0                       # ne' indice ne' ID: lo dice il ramo sotto
         b = next((x for x in BODIES if x["id"] == mid), None)
         if b is None and mid:
             b = {"id": mid, "fam": "?", "chi": "?", "tipo": "?",

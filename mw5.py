@@ -631,12 +631,18 @@ def find_mod_roots(tree):
     return out
 
 
-def install_tree(src, install=None, force=True):
-    """Copia una cartella-mod in Mods/. Ritorna (nome_cartella, era_update)."""
+def install_tree(src, install=None, force=True, name=""):
+    """Copia una cartella-mod in Mods/. Ritorna (nome_cartella, era_update).
+
+    'name' serve quando la cartella sorgente non ha un nome utilizzabile: un
+    archivio con mod.json in cima ha per radice la NOSTRA cartella di
+    estrazione, e prenderne il basename installava ogni mod di quel genere
+    dentro Mods/mw5-extract, una sopra l'altra.
+    """
     md = mods_dir(install)
     if not md:
         raise RuntimeError("installazione MW5 non trovata")
-    folder = os.path.basename(src.rstrip(os.sep))
+    folder = name or os.path.basename(src.rstrip(os.sep))
     dest = os.path.join(md, folder)
     existed = os.path.isdir(dest)
     if existed and not force:
@@ -751,8 +757,14 @@ def install_archive(archive, install=None, enable=True, force=True, log=print):
         cfg, ns = cfg_load()
         for r in roots:
             meta = read_mod_json(r) or {}
-            candidates.append((os.path.basename(r.rstrip(os.sep)), meta))
-            folder, was_update = install_tree(r, install, force=force)
+            # il nome si decide qui e vale sia per l'installazione sia per il
+            # menu di choose_to_enable: calcolarlo due volte voleva dire
+            # proporre una mod col nome della cartella di estrazione
+            fallback = (c.name_from_archive(archive)
+                        if os.path.normpath(r) == os.path.normpath(tmp) else "")
+            folder, was_update = install_tree(r, install, force=force,
+                                              name=fallback)
+            candidates.append((folder, meta))
             entry = ns.setdefault("mods", {}).setdefault(folder, {})
             entry["display_name"] = str(meta.get("displayName") or folder)
             entry["mod_version"] = str(meta.get("version") or "")
@@ -1487,7 +1499,8 @@ def _crash_info(d):
     p = os.path.join(d, "CrashContext.runtime-xml")
     try:
         ts = os.stat(p).st_mtime
-        txt = open(p, errors="replace").read()
+        with open(p, errors="replace") as f:
+            txt = f.read()
     except OSError:
         return None
     def tag(name):
