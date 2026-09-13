@@ -838,62 +838,10 @@ def _variant_key(name):
 
 
 def remote_status(files, entry):
-    """Confronta cosa c'e' su Nexus con cosa e' installato.
-
-    Ritorna (stato, file_da_scaricare, versione_remota, nota). Stati:
-      "update"   esiste una versione piu' nuova della SUA variante
-      "ok"       sei all'ultima
-      "variant"  stessa versione, file diverso: la mod pubblica piu' varianti
-                 (es. ritratti con e senza sfondi) e non va scambiata
-      "gone"     il file installato non e' piu' in elenco
-      "unknown"  non sappiamo quale file fosse installato
-
-    Il confronto e' fatto dentro la stessa variante, identificata dal nome del
-    file al netto della versione (vedi _variant_key): altrimenti un update ti
-    sostituirebbe la variante scelta con un'altra.
-    """
-    us = usable_files(files)
-    if not us:
-        return "gone", None, "", "nessun file scaricabile"
-    fid = entry.get("installed_file_id")
-    if not fid:
-        return "unknown", core().pick_main_file(us), "", ""
-    inst = next((f for f in files if f.get("file_id") == fid), None)
-    if inst is None:
-        f = core().pick_main_file(us)
-        return "gone", f, (f.get("version") or "").strip(), \
-            "il file installato non e' piu' su Nexus"
-    # la variante e' solo nome-senza-versione: la categoria NON entra nella
-    # scelta del target di aggiornamento. Restringere per categoria sembrava
-    # giusto (MAIN e OPTIONAL paralleli non sono l'uno l'aggiornamento
-    # dell'altro), ma due file che condividono lo stesso nome ripulito e
-    # differiscono solo per categoria sono quasi sempre lo stesso contenuto nel
-    # tempo -- un autore che pubblica varianti davvero parallele le nomina
-    # diversamente ("with portraits" / "without portraits"), e allora
-    # _variant_key le separa gia' da sole. Il caso che la categoria dovrebbe
-    # proteggere non si presenta mai; quello che rompe (un file ricategorizzato
-    # fra una release e l'altra, es. MAIN -> UPDATE, sparisce come aggiornamento)
-    # si presenta eccome. Stessa logica di variant_key: si preferisce rischiare
-    # uno scambio di variante piuttosto che perdere aggiornamenti in silenzio.
-    cat = str(inst.get("category_name") or "").upper()
-    key = _variant_key(inst.get("name"))
-    same = [f for f in us if _variant_key(f.get("name")) == key] or [inst]
-    target = max(same, key=lambda f: _vkey(f.get("version")))
-    iv = (inst.get("version") or "").strip()
-    tv = (target.get("version") or "").strip()
-    if _vkey(tv) > _vkey(iv):
-        return "update", target, tv, ""
-    # varianti = altri file della STESSA categoria alla stessa versione. I
-    # "Source files" stanno in MISCELLANEOUS e non sono alternative giocabili.
-    others = [f for f in us if f.get("file_id") != fid
-              and str(f.get("category_name") or "").upper() == cat
-              and _vkey(f.get("version")) == _vkey(iv)]
-    if others:
-        return "variant", None, iv, \
-            "altre varianti alla stessa versione: " + ", ".join(
-                str(f.get("name")) for f in others[:3])
-    return "ok", None, iv, ""
-
+    """Confronta cosa c'e' su Nexus con cosa e' installato. Condivisa col core
+    (remote_status()): stessi stati e stessa logica per i tre giochi, vedi il
+    docstring li' per il perche' del confronto per variante."""
+    return core().remote_status(files, entry)
 
 def link_folder(folder, mod_id, ns, file_id=None, version=""):
     entry = ns.setdefault("mods", {}).setdefault(folder, {})

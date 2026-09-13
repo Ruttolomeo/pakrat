@@ -161,20 +161,24 @@ class BG3Adapter:
         for m in mapped:
             entry = cfg["mods"][m.uuid]
             try:
-                info = core.nexus_get(f"/mods/{entry['nexus_id']}.json", cfg["nexus_api_key"])
+                files = core.nexus_files(entry["nexus_id"], cfg["nexus_api_key"])
             except core.NexusError as ex:
                 on_row(m.uuid, f"errore: {ex}")
                 errors += 1
                 continue
-            remote = (info.get("version") or "").strip()
-            local = entry.get("installed_version") or m.version
-            if info.get("status") not in (None, "published"):
-                on_row(m.uuid, f"mod {info.get('status')}")
-            elif remote and remote != local:
-                on_row(m.uuid, f"aggiornamento -> {remote}")
-            else:
-                on_row(m.uuid, "aggiornata")
-            entry["remote_version"] = remote
+            # stesso confronto e stesse etichette di BackendAdapter: prima qui
+            # si guardavano le stringhe di versione, e "1.0" contro "1.0.0"
+            # annunciava un aggiornamento che non c'era
+            state, _f, rv, note = core.remote_status(files, entry)
+            label = {
+                "update": f"aggiornamento -> {rv or '?'}",
+                "gone": f"! {note}" if note else "non piu' su Nexus",
+                "variant": f"aggiornata ({note})" if note else "aggiornata",
+                "unknown": "non verificabile (reinstalla per registrare il file)",
+            }.get(state, "aggiornata")
+            on_row(m.uuid, label)
+            if rv:
+                entry["remote_version"] = rv
         core.save_config(cfg)
         return (f"controllo completato su {len(mapped)} mod"
                 + (f", {errors} errori" if errors else ""))

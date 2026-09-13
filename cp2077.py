@@ -1436,55 +1436,10 @@ def _variant_key(name):
 
 
 def remote_status(files, entry):
-    """Confronta cosa c'e' su Nexus con cosa e' installato.
-
-    Stessa logica del backend MW5, e per lo stesso motivo: il confronto e' sul
-    file_id dentro la stessa variante -- identificata dal nome del file al netto
-    della versione, vedi _variant_key -- non sulla stringa di versione. Su
-    Cyberpunk la cosa e' anche piu' sentita, perche' una mod pubblica spesso
-    varianti parallele (per corpo, per versione del gioco, con o senza
-    dipendenze) che non sono l'una l'aggiornamento dell'altra.
-    """
-    us = usable_files(files)
-    if not us:
-        return "gone", None, "", "nessun file scaricabile"
-    fid = entry.get("installed_file_id")
-    if not fid:
-        return "unknown", core().pick_main_file(us), "", ""
-    inst = next((f for f in files if f.get("file_id") == fid), None)
-    if inst is None:
-        f = core().pick_main_file(us)
-        return "gone", f, (f.get("version") or "").strip(), \
-            "il file installato non e' piu' su Nexus"
-    # la variante e' solo nome-senza-versione: la categoria NON entra nella
-    # scelta del target di aggiornamento. Restringere per categoria sembrava
-    # giusto (MAIN e OPTIONAL paralleli non sono l'uno l'aggiornamento
-    # dell'altro), ma due file che condividono lo stesso nome ripulito e
-    # differiscono solo per categoria sono quasi sempre lo stesso contenuto nel
-    # tempo -- un autore che pubblica varianti davvero parallele le nomina
-    # diversamente ("con ritratti" / "senza ritratti"), e allora _variant_key
-    # le separa gia' da sole. Il caso che la categoria dovrebbe proteggere non
-    # si presenta mai; quello che rompe (un file ricategorizzato fra una
-    # release e l'altra, es. MAIN -> UPDATE, sparisce come aggiornamento) si
-    # presenta eccome. Stessa logica di variant_key: si preferisce rischiare
-    # uno scambio di variante piuttosto che perdere aggiornamenti in silenzio.
-    cat = str(inst.get("category_name") or "").upper()
-    key = _variant_key(inst.get("name"))
-    same = [f for f in us if _variant_key(f.get("name")) == key] or [inst]
-    target = max(same, key=lambda f: _vkey(f.get("version")))
-    iv = (inst.get("version") or "").strip()
-    tv = (target.get("version") or "").strip()
-    if _vkey(tv) > _vkey(iv):
-        return "update", target, tv, ""
-    others = [f for f in us if f.get("file_id") != fid
-              and str(f.get("category_name") or "").upper() == cat
-              and _vkey(f.get("version")) == _vkey(iv)]
-    if others:
-        return "variant", None, iv, \
-            "altre varianti alla stessa versione: " + ", ".join(
-                str(f.get("name")) for f in others[:3])
-    return "ok", None, iv, ""
-
+    """Confronta cosa c'e' su Nexus con cosa e' installato. Condivisa col core
+    (remote_status()): stessi stati e stessa logica per i tre giochi, vedi il
+    docstring li' per il perche' del confronto per variante."""
+    return core().remote_status(files, entry)
 
 def link_slug(slug, mod_id, ns, file_id=None, version=""):
     entry = ns.setdefault("mods", {}).setdefault(slug, {})

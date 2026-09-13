@@ -913,27 +913,37 @@ def cmd_check():
         print("scarica le mod col pulsante 'Mod Manager Download' dopo 'pakrat handler'.")
         return 1
 
-    errors = 0
+    errors = unknown = 0
     for m in mapped:
         entry = cfg["mods"][m.uuid]
         try:
-            info = nexus_get(f"/mods/{entry['nexus_id']}.json", cfg["nexus_api_key"])
+            files = nexus_files(entry["nexus_id"], cfg["nexus_api_key"])
         except NexusError as ex:
             print(f"{m.name[:40]:40} ERRORE: {ex}")
             errors += 1
             continue
-        remote = _nexus_version_of(info)
+        st, _f, remote, note = remote_status(files, entry)
         local = entry.get("installed_version") or m.version
-        if info.get("status") not in (None, "published"):
-            flag = f"mod {info.get('status')} su Nexus"
-        elif remote and remote != local:
-            flag = f"AGGIORNAMENTO -> {remote}"
+        if st == "update":
+            flag = f"AGGIORNAMENTO -> {remote or '?'}"
+        elif st == "gone":
+            flag = "! " + (note or "non piu' su Nexus")
+            unknown += 1
+        elif st == "variant":
+            flag = f"aggiornata  ({note})"
+        elif st == "unknown":
+            flag = "file installato non registrato, non verificabile"
+            unknown += 1
         else:
             flag = "aggiornata"
         print(f"{m.name[:40]:40} {local:>12}  {flag}")
         entry["last_check"] = int(time.time())
-        entry["remote_version"] = remote
+        if remote:
+            entry["remote_version"] = remote
     save_config(cfg)
+    if unknown:
+        print(f"\n{unknown} non verificabili: reinstallale con 'pakrat update N' "
+              "per registrare il file di provenienza")
     return 1 if errors else 0
 
 
@@ -1050,6 +1060,70 @@ def variant_key(name):
     return re.sub(r'[\s_.-]+', " ", s).strip()
 
 
+def remote_status(files, entry):
+    """Confronta cosa c'e' su Nexus con cosa e' installato.
+
+    Ritorna (stato, file_da_scaricare, versione_remota, nota). Stati:
+      "update"   esiste una versione piu' nuova della SUA variante
+      "ok"       sei all'ultima
+      "variant"  stessa versione, file diverso: la mod pubblica piu' varianti
+                 (es. ritratti con e senza sfondi) e non va scambiata
+      "gone"     il file installato non e' piu' in elenco
+      "unknown"  non sappiamo quale file fosse installato
+
+    Condivisa dai tre giochi. Il confronto NON e' sulla stringa di versione ma
+    sul file_id dentro la stessa variante, identificata dal nome del file al
+    netto della versione (vedi variant_key): confrontare le versioni come
+    stringhe dice "aggiornamento" per "1.0" contro "1.0.0", e confrontare i
+    nomi tali e quali mette ogni release in una variante a se'. Dentro la
+    variante si prende la versione piu' alta, altrimenti un update
+    sostituirebbe la variante scelta con un'altra.
+
+    La categoria NON entra nella scelta del target. Restringere per categoria
+    sembrava giusto (MAIN e OPTIONAL paralleli non sono l'uno l'aggiornamento
+    dell'altro), ma due file che condividono lo stesso nome ripulito e
+    differiscono solo per categoria sono quasi sempre lo stesso contenuto nel
+    tempo -- un autore che pubblica varianti davvero parallele le nomina
+    diversamente ("con ritratti" / "senza ritratti"), e allora variant_key le
+    separa gia' da sola. Il caso che la categoria dovrebbe proteggere non si
+    presenta mai; quello che rompe (un file ricategorizzato fra una release e
+    l'altra, es. MAIN -> UPDATE, sparisce come aggiornamento) si presenta
+    eccome. Si preferisce rischiare uno scambio di variante piuttosto che
+    perdere aggiornamenti in silenzio.
+
+    Le varianti segnalate sono invece gli altri file della STESSA categoria
+    alla stessa versione: i "Source files" stanno in MISCELLANEOUS e non sono
+    alternative giocabili.
+    """
+    us = usable_files(files)
+    if not us:
+        return "gone", None, "", "nessun file scaricabile"
+    fid = entry.get("installed_file_id")
+    if not fid:
+        return "unknown", pick_main_file(us), "", ""
+    inst = next((f for f in files if f.get("file_id") == fid), None)
+    if inst is None:
+        f = pick_main_file(us)
+        return "gone", f, (f.get("version") or "").strip(), \
+            "il file installato non e' piu' su Nexus"
+    cat = str(inst.get("category_name") or "").upper()
+    key = variant_key(inst.get("name"))
+    same = [f for f in us if variant_key(f.get("name")) == key] or [inst]
+    target = max(same, key=lambda f: version_key(f.get("version")))
+    iv = (inst.get("version") or "").strip()
+    tv = (target.get("version") or "").strip()
+    if version_key(tv) > version_key(iv):
+        return "update", target, tv, ""
+    others = [f for f in us if f.get("file_id") != fid
+              and str(f.get("category_name") or "").upper() == cat
+              and version_key(f.get("version")) == version_key(iv)]
+    if others:
+        return "variant", None, iv, \
+            "altre varianti alla stessa versione: " + ", ".join(
+                str(f.get("name")) for f in others[:3])
+    return "ok", None, iv, ""
+
+
 def name_from_archive(path):
     """Nome mod ricavato dal file scaricato, ripulito dal codice Nexus.
 
@@ -1157,12 +1231,22 @@ def update_mod(mod, entry, api_key, log=print):
         files = nexus_files(mod_id, api_key)
     except NexusError as ex:
         return False, str(ex)
-    f = pick_main_file(files)
-    if not f:
+    state, f, remote_ver, note = remote_status(files, entry)
+    if state == "ok":
+        return False, f"gia' aggiornata ({remote_ver or '?'})"
+    if state == "variant":
+        # Piu' file alla stessa versione nella stessa categoria sono varianti,
+        # non aggiornamenti: scaricare l'altra sostituirebbe una scelta
+        # deliberata dell'utente.
+        return False, (f"gia' aggiornata ({remote_ver or '?'}); {note} — "
+                       "per cambiare variante scaricala dal sito")
+    if f is None:
         return False, "nessun file scaricabile (solo versioni vecchie o archiviate)"
-    remote_ver = (f.get("version") or "").strip()
-    if entry.get("installed_file_id") == f["file_id"]:
-        return False, f"gia' aggiornata ({remote_ver})"
+    if state == "unknown":
+        # associata con link/match/discover: il file di provenienza non lo
+        # sappiamo, quindi si prende il principale e lo si registra adesso
+        log("  attenzione: file di provenienza non registrato, "
+            f"installo il principale ({f.get('name')})")
 
     # Account non premium: l'API non rilascia link diretti. L'unica via legittima
     # e' il pulsante "Mod Manager Download" sul sito, che genera un nxm:// con
@@ -1434,8 +1518,13 @@ def cmd_nxm(url):
         if ok:
             m = mod_from_pak(dest)
             if m:
+                # il file_id arriva dal link nxm:// ed e' cio' che rende
+                # verificabile il confronto: senza, remote_status non sa da
+                # quale file partire e 'check' risponde "non verificabile"
                 cfg["mods"].setdefault(m.uuid, {}).update(
-                    {"nexus_id": mod_id, "name": m.name, "installed_version": version or m.version})
+                    {"nexus_id": mod_id, "name": m.name,
+                     "installed_file_id": file_id,
+                     "installed_version": version or m.version})
                 save_config(cfg)
                 print(f"associata a nexusmods.com/baldursgate3/mods/{mod_id}")
         print("apri 'pakrat' per attivarla nel load order")
