@@ -2403,6 +2403,23 @@ def _file_installed(file_id, ns):
                for e in (ns.get("mods") or {}).values())
 
 
+def _slug_for_file(file_id, ns):
+    """Lo slug gia' installato per questo file_id, se c'e' (e non rimosso).
+
+    Serve a 'fetch_and_install' per riconoscere un file che e' gia' sul disco
+    PRIMA di scaricarlo di nuovo: lo slug si ricava dal nome dell'archivio
+    scaricato (vedi _slug_from_archive), e Nexus non lo garantisce stabile fra
+    un download e l'altro dello stesso file (i file "manual download only"
+    portano un token variabile nel nome). Senza questo controllo, rifare
+    'get' su una mod gia' installata — doppio click compreso — produceva una
+    SECONDA voce nel manifest invece di riconoscere la prima."""
+    for slug, e in (ns.get("mods") or {}).items():
+        if (int(e.get("installed_file_id") or 0) == int(file_id)
+                and not e.get("removed_at")):
+            return slug
+    return None
+
+
 def install_file_extras(mod_id, api_key, install, files, enable=True):
     """Installa gli altri file della pagina. Ritorna (slug fatti, rc).
 
@@ -2480,6 +2497,12 @@ def fetch_and_install(mod_id, api_key, install, enable=True, file_id=None,
         f = c.pick_main_file(files)
     if f is None:
         return None, "nessun file scaricabile"
+    _cfg0, ns0 = cfg_load()
+    gia = _slug_for_file(f["file_id"], ns0)
+    if gia:
+        print(f"  {f.get('name') or name}: gia' installata "
+              "(pakrat cp2077 update per riprenderla in caso di problemi)")
+        return gia, ""
     # senza premium l'API non da' link diretti: si passa dal browser, ed e'
     # esattamente cio' che fa il pulsante "Mod Manager Download"
     if not c.is_premium(api_key):
